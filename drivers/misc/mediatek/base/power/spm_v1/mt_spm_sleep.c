@@ -21,6 +21,7 @@
 #include <linux/i2c.h>
 #include <linux/of_fdt.h>
 #include <asm/setup.h>
+#include <asm/sysreg.h>
 #include <linux/lockdep.h>
 
 #if 0
@@ -71,6 +72,113 @@
 #if defined(CONFIG_ARCH_MT6570) || defined(CONFIG_MACH_MT6580)
 #define DISABLE_DLPT_FEATURE
 #endif
+/*
+ * m5c: keep the hardware watchdog running through an SPM suspend.
+ * The suspend path stops it (wd_suspend_notify) before handing the SoC to
+ * the PCM, so a hang between "[SPM] sec = ..." and the WFI - seen on
+ * 2026-09-30 - left the phone dead until a 15 s
+ * power-key press. With 1 a hang ends in a watchdog reset instead, and a
+ * test suspend shorter than the watchdog period (RTC wakealarm of ~10 s)
+ * still resumes normally. 2 = the same, but no WFI: the PCM state is
+ * dumped once a second for ~12 s (kernel O). For unattended test runs
+ * only; default 0.
+ */
+static int forge_spm_wdt_in_suspend;
+core_param(forge_spm_wdt_in_suspend, forge_spm_wdt_in_suspend, int, 0644);
+static int forge_spm_sleep_guard_s = 20;
+core_param(forge_spm_sleep_guard_s, forge_spm_sleep_guard_s, int, 0644);
+/* RGU watchdog length is 30 s here (mtk_wdt.c); keep >= 5 s for entry/exit */
+#define FORGE_SPM_GUARD_MAX_S	25
+
+/*
+ * m5c: step markers between "[SPM] sec = ..." and the wake reason,
+ * printed only in the watchdog test mode above. console-ramoops keeps them
+ * across the watchdog reset, so the last one names the step that hung.
+ */
+static void forge_spm_dump_pcm(const char *tag)
+{
+	u32 pc[4];
+	int k;
+
+	for (k = 0; k < 4; k++) {
+		pc[k] = spm_read(SPM_PCM_REG15_DATA);
+		udelay(100);
+	}
+	printk(KERN_EMERG "[SPM] forge %s pc %x %x %x %x fsm 0x%x con0 0x%x con1 0x%x\n",
+	       tag, pc[0], pc[1], pc[2], pc[3], spm_read(SPM_PCM_FSM_STA),
+	       spm_read(SPM_PCM_CON0), spm_read(SPM_PCM_CON1));
+	printk(KERN_EMERG "[SPM] forge %s timer_val 0x%x timer_out 0x%x sleep_timer 0x%x isr_mask 0x%x isr_sta 0x%x\n",
+	       tag, spm_read(SPM_PCM_TIMER_VAL), spm_read(SPM_PCM_TIMER_OUT),
+	       spm_read(SPM_SLEEP_TIMER_STA), spm_read(SPM_SLEEP_ISR_MASK),
+	       spm_read(SPM_SLEEP_ISR_STATUS));
+	printk(KERN_EMERG "[SPM] forge %s wake_mask 0x%x cpu_wake 0x%x pwr_io 0x%x r13 0x%x src_req 0x%x\n",
+	       tag, spm_read(SPM_SLEEP_WAKEUP_EVENT_MASK), spm_read(SPM_SLEEP_CPU_WAKEUP_EVENT),
+	       spm_read(SPM_PCM_PWR_IO_EN), spm_read(SPM_PCM_REG13_DATA),
+	       spm_read(SPM_PCM_SRC_REQ));
+	/* kernel P: the registers the stock PCM branches on (c18) */
+	printk(KERN_EMERG "[SPM] forge %s r0 0x%x r6 0x%x r7 0x%x r12 0x%x r14 0x%x res3 0x%x res4 0x%x\n",
+	       tag, spm_read(SPM_PCM_REG0_DATA), spm_read(SPM_PCM_REG6_DATA),
+	       spm_read(SPM_PCM_REG7_DATA), spm_read(SPM_PCM_REG12_DATA),
+	       spm_read(SPM_PCM_REG14_DATA), spm_read(SPM_PCM_RESERVE3), spm_read(SPM_PCM_RESERVE4));
+	printk(KERN_EMERG "[SPM] forge %s raw_sta 0x%x misc 0x%x idle_sta 0x%x wdt_val 0x%x wdt_out 0x%x dpd3 0x%x pwr_sta 0x%x\n",
+	       tag, spm_read(SPM_SLEEP_ISR_RAW_STA), spm_read(SPM_SLEEP_WAKEUP_MISC),
+	       spm_read(SPM_SLEEP_SUBSYS_IDLE_STA), spm_read(SPM_PCM_WDT_TIMER_VAL),
+	       spm_read(SPM_PCM_WDT_TIMER_OUT), spm_read(SPM_PCM_PASR_DPD_3), spm_read(SPM_PWR_STATUS));
+}
+
+/*
+ * m5c: mode 3 = a real WFI with a backstop. The CPU's physical timer
+ * (CNTP, PPI 30 - the one Linux itself uses here) is armed for forge_spm_wfi_backstop_ms and unmasked next to the
+ * SPM IRQ, so a WFI that nothing else ends still returns. The state is then
+ * dumped: where the PCM stands (0x23a = still waiting for the CPU, 0x387 =
+ * woke and sits in the vcore loop), whether the SPM IRQ is pending at the
+ * GIC, and whether the backstop or something else ended the WFI.
+ * Mode 4 = first a control WFI with the same backstop before the PCM is
+ * touched (proves the backstop can end a WFI here), then mode 3.
+ * Kernels Q/R, coverage journal c21-c22. Test mode only.
+ */
+static int forge_spm_wfi_backstop_ms = 3000;
+core_param(forge_spm_wfi_backstop_ms, forge_spm_wfi_backstop_ms, int, 0644);
+static u64 forge_bs_ctl, forge_bs_cval, forge_bs_t0;
+extern int spm_dormant_sta;
+
+static void forge_wfi_backstop_arm(void)
+{
+	u64 frq = read_sysreg(cntfrq_el0);
+
+	forge_bs_ctl = read_sysreg(cntp_ctl_el0);
+	forge_bs_cval = read_sysreg(cntp_cval_el0);
+	mt_irq_unmask_for_sleep(30);
+	forge_bs_t0 = read_sysreg(cntpct_el0);
+	write_sysreg(forge_bs_t0 + frq * forge_spm_wfi_backstop_ms / 1000, cntp_cval_el0);
+	write_sysreg(1, cntp_ctl_el0);	/* enable, not masked */
+	isb();
+	printk(KERN_EMERG "[SPM] forge backstop armed %d ms, saved ctl 0x%llx, pend30 %u pend197 %u\n",
+	       forge_spm_wfi_backstop_ms, forge_bs_ctl, mt_irq_get_pending_hw(30),
+	       mt_irq_get_pending_hw(SPM_IRQ0_ID));
+}
+
+static void forge_wfi_backstop_disarm(void)
+{
+	u64 ctl = read_sysreg(cntp_ctl_el0);
+	u64 dt = read_sysreg(cntpct_el0) - forge_bs_t0;
+
+	write_sysreg(0, cntp_ctl_el0);
+	isb();
+	printk(KERN_EMERG "[SPM] forge post-wfi after %llu ticks, cntp_ctl 0x%llx (istatus %llu), pend30 %u pend197 %u dormant %d\n",
+	       dt, ctl, (ctl >> 2) & 1, mt_irq_get_pending_hw(30), mt_irq_get_pending_hw(SPM_IRQ0_ID),
+	       spm_dormant_sta);
+	forge_spm_dump_pcm("post-wfi");
+	write_sysreg(forge_bs_cval, cntp_cval_el0);
+	write_sysreg(forge_bs_ctl, cntp_ctl_el0);
+	isb();
+}
+
+#define FORGE_SPM_MARK(n) do { \
+	if (forge_spm_wdt_in_suspend) \
+		printk(KERN_EMERG "[SPM] forge mark %d\n", (n)); \
+} while (0)
+
 /**************************************
  * only for internal debug
  **************************************/
@@ -788,7 +896,7 @@ static void spm_set_sysclk_settle(void)
 	spm_warn("md_settle = %u, settle = %u\n", md_settle, settle);
 }
 
-static void spm_kick_pcm_to_run(struct pwr_ctrl *pwrctrl)
+static int spm_kick_pcm_to_run(struct pwr_ctrl *pwrctrl)
 {
 	/* enable PCM WDT (normal mode) to start count if needed */
 #if SPM_PCMWDT_EN
@@ -823,7 +931,7 @@ static void spm_kick_pcm_to_run(struct pwr_ctrl *pwrctrl)
 	clkmux_sel(MT_MUX_SCP, 0, "SPM-Sleep");
 #endif
 
-	__spm_kick_pcm_to_run(pwrctrl);
+	return __spm_kick_pcm_to_run(pwrctrl);
 }
 
 static void spm_trigger_wfi_for_sleep(struct pwr_ctrl *pwrctrl)
@@ -1079,6 +1187,7 @@ wake_reason_t spm_go_to_sleep(u32 spm_flags, u32 spm_data)
 	static wake_reason_t last_wr = WR_NONE;
 	struct pcm_desc *pcmdesc;
 	struct pwr_ctrl *pwrctrl;
+	int guard;
 
 #ifndef DISABLE_DLPT_FEATURE
 	get_dlpt_imix_spm();
@@ -1112,11 +1221,35 @@ wake_reason_t spm_go_to_sleep(u32 spm_flags, u32 spm_data)
 #if SPM_PWAKE_EN
 	sec = spm_get_wake_period(-1 /* FIXME */ , last_wr);
 #endif
+	/*
+	 * (m5c) guard: cap one SPM sleep and keep the watchdog running
+	 * through it. Every sleep then ends in a PCM-timer wake at the latest,
+	 * and a hang in the sleep path ends in a watchdog reset (bootguard and
+	 * LK bring the phone back) instead of a phone that needs a 15 s power
+	 * key press. The RGU watchdog length is at most ~31.9 s (11-bit field,
+	 * 1/64 s units), so the cap stays well below it. 0 = stock behaviour
+	 * (sleep up to the fuel-gauge period, watchdog stopped).
+	 */
+	guard = forge_spm_sleep_guard_s;
+	if (guard < 0)
+		guard = 0;		/* negative = off, never "WDT on, no cap" */
+	if (guard > FORGE_SPM_GUARD_MAX_S)
+		guard = FORGE_SPM_GUARD_MAX_S;
+	if (guard && sec > guard)
+		sec = guard;
 	pwrctrl->timer_val = sec * 32768;
+	if (guard && pwrctrl->timer_val_cust > guard * 32768) {
+		/* the suspend_ctrl test knob overrides timer_val: tame it too */
+		spm_warn("timer_val_cust 0x%x over the %d s guard, capped\n",
+			 pwrctrl->timer_val_cust, guard);
+		pwrctrl->timer_val_cust = guard * 32768;
+	}
 
 	wd_ret = get_wd_api(&wd_api);
-	if (!wd_ret)
+	if (!wd_ret && !forge_spm_wdt_in_suspend && !guard)
 		wd_api->wd_suspend_notify();
+	else if (!wd_ret)
+		wd_api->wd_restart(WD_TYPE_NORMAL);	/* a full period from here */
 
 	/* todo: quick fix build error */
 	mt_power_gs_dump_suspend();
@@ -1152,24 +1285,43 @@ wake_reason_t spm_go_to_sleep(u32 spm_flags, u32 spm_data)
 		  sec, pwrctrl->wake_src, is_cpu_pdn(pwrctrl->pcm_flags),
 		  is_infra_pdn(pwrctrl->pcm_flags));
 
+	FORGE_SPM_MARK(1);
+	if (forge_spm_wdt_in_suspend == 4) {
+		/* control: the backstop alone, PCM untouched */
+		forge_wfi_backstop_arm();
+		wfi_with_sync();
+		forge_wfi_backstop_disarm();
+	}
 	if (request_uart_to_sleep()) {
 		last_wr = WR_UART_BUSY;
 		goto RESTORE_IRQ;
 	}
 
 
-	__spm_reset_and_init_pcm(pcmdesc);
+	FORGE_SPM_MARK(2);
+	if (__spm_reset_and_init_pcm(pcmdesc)) {
+		/* the running PCM kept its code: nothing below was touched */
+		request_uart_to_wakeup();
+		last_wr = WR_UNKNOWN;
+		goto RESTORE_IRQ;
+	}
 
+	FORGE_SPM_MARK(3);
 	__spm_kick_im_to_fetch(pcmdesc);
 
+	FORGE_SPM_MARK(4);
 	__spm_init_pcm_register();
 
+	FORGE_SPM_MARK(5);
 	__spm_init_event_vector(pcmdesc);
 
+	FORGE_SPM_MARK(6);
 	__spm_set_power_control(pwrctrl);
 
+	FORGE_SPM_MARK(7);
 	__spm_set_wakeup_event(pwrctrl);
 
+	FORGE_SPM_MARK(8);
 #if !defined(CONFIG_ARCH_MT6570) && !defined(CONFIG_MACH_MT6580)
 	mt_cpufreq_set_pmic_phase(PMIC_WRAP_PHASE_SUSPEND);
 #endif
@@ -1199,7 +1351,19 @@ wake_reason_t spm_go_to_sleep(u32 spm_flags, u32 spm_data)
 
 #else
 #endif
-	spm_kick_pcm_to_run(pwrctrl);
+	FORGE_SPM_MARK(9);
+	if (forge_spm_wdt_in_suspend)
+		printk(KERN_EMERG "[SPM] forge im_ptr 0x%x im_len 0x%x base_dma 0x%llx\n",
+		       spm_read(SPM_PCM_IM_PTR), spm_read(SPM_PCM_IM_LEN),
+		       (unsigned long long)pcmdesc->base_dma);
+	if (spm_kick_pcm_to_run(pwrctrl)) {
+		/* PCM loaded but never kicked: undo the entry steps, no WFI */
+		mt_cpufreq_set_pmic_phase(PMIC_WRAP_PHASE_NORMAL);
+		spm_clean_after_wakeup();
+		request_uart_to_wakeup();
+		last_wr = WR_UNKNOWN;
+		goto RESTORE_IRQ;
+	}
 
 #if SPM_AEE_RR_REC
 	aee_rr_rec_spm_suspend_val(aee_rr_curr_spm_suspend_val() | (1 << SPM_SUSPEND_ENTER_WFI));
@@ -1208,7 +1372,30 @@ wake_reason_t spm_go_to_sleep(u32 spm_flags, u32 spm_data)
 #if defined(CONFIG_ARCH_MT6570) || defined(CONFIG_MACH_MT6580)
 	gic_set_primask();
 #endif
-	spm_trigger_wfi_for_sleep(pwrctrl);
+	FORGE_SPM_MARK(10);
+	if (forge_spm_wdt_in_suspend)
+		forge_spm_dump_pcm("pre-wfi");
+	if (forge_spm_wdt_in_suspend == 2) {
+		/*
+		 * m5c: no WFI. Watch the PCM for ~12 s while this CPU
+		 * stays awake (wfi_op AND keeps the PCM short of the sleep
+		 * itself), then fall through the normal wake path.
+		 */
+		int t;
+
+		for (t = 0; t < 12; t++) {
+			mdelay(1000);
+			if (!wd_ret)
+				wd_api->wd_restart(WD_TYPE_NORMAL);
+			forge_spm_dump_pcm("poll");
+		}
+	} else if (forge_spm_wdt_in_suspend >= 3) {
+		forge_wfi_backstop_arm();
+		spm_trigger_wfi_for_sleep(pwrctrl);
+		forge_wfi_backstop_disarm();
+	} else
+		spm_trigger_wfi_for_sleep(pwrctrl);
+	FORGE_SPM_MARK(11);
 #if defined(CONFIG_ARCH_MT6570) || defined(CONFIG_MACH_MT6580)
 	gic_clear_primask();
 #endif
@@ -1233,6 +1420,7 @@ wake_reason_t spm_go_to_sleep(u32 spm_flags, u32 spm_data)
 
 	/* record last wakesta */
 	/* last_wr = spm_output_wake_reason(&wakesta, pcmdesc); */
+	FORGE_SPM_MARK(12);
 	last_wr = spm_output_wake_reason(&spm_wakesta, pcmdesc);
 #if 0
 	pmic_read_interface_nolock(MT6328_VRF18_0_CON0, &temp_c, 0xFFFF, 0);

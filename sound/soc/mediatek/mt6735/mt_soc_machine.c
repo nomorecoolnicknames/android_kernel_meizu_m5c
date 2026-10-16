@@ -982,6 +982,11 @@ static struct snd_soc_dai_link mt_soc_dai_common[] = {
 	 .init = mt_soc_audio_init,
 	 .ops = &mt_machine_audio_ops,
 	 },
+#if 0 /* the stock DTB has no mediatek,mt_soc_pcm_deep_buffer_dl node,
+ * so this platform device is never created and the whole card fails to
+ * register ("ASoC: platform mt-soc-deep-buffer-dl-pcm not registered").
+ * It is the only one of the 28 audio compatibles the stock tree omits;
+ * dropping the link lets the card come up on the 27 that do exist. */
 	 {
 	 .name = "DEEP_BUFFER_DL_OUTPUT",
 	 .stream_name = MT_SOC_DEEP_BUFFER_DL_STREAM_NAME,
@@ -992,6 +997,7 @@ static struct snd_soc_dai_link mt_soc_dai_common[] = {
 	 .init = mt_soc_audio_init,
 	 .ops = &mt_machine_audio_ops,
 	 },
+#endif
 	{
 	 .name = "DL1AWBCAPTURE",
 	 .stream_name = MT_SOC_DL1_AWB_RECORD_STREAM_NAME,

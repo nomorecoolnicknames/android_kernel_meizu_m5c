@@ -14,6 +14,7 @@
 #include <linux/i2c.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
+#include <linux/moduleparam.h>
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
@@ -141,48 +142,55 @@ EXPORT_SYMBOL(mtkcam_gpio_init);
 
 int mtkcam_gpio_set(int PinIdx, int PwrType, int Val)
 {
+	/* m5c: rewritten to (a) name the pinctrl state it drives
+	 * dmesg - the previous bring-up round could not tell from the logs
+	 * which pins actually moved - and (b) refuse to feed an ERR pointer
+	 * from a failed pinctrl_lookup_state() into pinctrl_select_state().
+	 * Selection logic is unchanged: pin set 0 = cam0_* (main), everything
+	 * else = cam1_* (front), matching both the stock DTB and our DTS
+	 * pinctrl-names.
+	 */
 	int ret = 0;
+	struct pinctrl_state *st = NULL;
+	const char *st_name = "?";
 
 	switch (PwrType) {
 	case CAMRST:
 		if (PinIdx == 0) {
-			if (Val == 0)
-				pinctrl_select_state(camctrl, cam0_rst_l);
-			else
-				pinctrl_select_state(camctrl, cam0_rst_h);
+			st = Val ? cam0_rst_h : cam0_rst_l;
+			st_name = Val ? "cam0_rst1" : "cam0_rst0";
 		} else {
-			if (Val == 0)
-				pinctrl_select_state(camctrl, cam1_rst_l);
-			else
-				pinctrl_select_state(camctrl, cam1_rst_h);
+			st = Val ? cam1_rst_h : cam1_rst_l;
+			st_name = Val ? "cam1_rst1" : "cam1_rst0";
 		}
 		break;
 	case CAMPDN:
 		if (PinIdx == 0) {
-			if (Val == 0)
-				pinctrl_select_state(camctrl, cam0_pnd_l);
-			else
-				pinctrl_select_state(camctrl, cam0_pnd_h);
+			st = Val ? cam0_pnd_h : cam0_pnd_l;
+			st_name = Val ? "cam0_pnd1" : "cam0_pnd0";
 		} else {
-			if (Val == 0)
-				pinctrl_select_state(camctrl, cam1_pnd_l);
-			else
-				pinctrl_select_state(camctrl, cam1_pnd_h);
+			st = Val ? cam1_pnd_h : cam1_pnd_l;
+			st_name = Val ? "cam1_pnd1" : "cam1_pnd0";
 		}
-
 		break;
 	case CAMLDO:
-		if (Val == 0)
-			pinctrl_select_state(camctrl, cam_ldo0_l);
-		else
-			pinctrl_select_state(camctrl, cam_ldo0_h);
+		st = Val ? cam_ldo0_h : cam_ldo0_l;
+		st_name = Val ? "cam_ldo0_1" : "cam_ldo0_0";
 		break;
 	default:
-		PK_DBG("PwrType(%d) is invalid !!\n", PwrType);
-		break;
+		pr_err("[kd_camera_hw] mtkcam_gpio_set: PwrType(%d) is invalid\n",
+		       PwrType);
+		return 0;
 	};
 
-	PK_DBG("PinIdx(%d) PwrType(%d) val(%d)\n", PinIdx, PwrType, Val);
+	if (IS_ERR_OR_NULL(camctrl) || IS_ERR_OR_NULL(st)) {
+		pr_err("[kd_camera_hw] pinctrl %s unavailable (PinIdx=%d PwrType=%d Val=%d)\n",
+		       st_name, PinIdx, PwrType, Val);
+		return 0;
+	}
+
+	ret = pinctrl_select_state(camctrl, st);
+	pr_info("[kd_camera_hw] pinctrl %s ret=%d\n", st_name, ret);
 
 	return ret;
 }
@@ -273,6 +281,44 @@ EXPORT_SYMBOL(checkPowerBeforClose);
 
 
 
+/* m5c: which rails the s5k5e8 ON branch actually enabled. On 4.9
+ * regulator_disable() decrements the shared rdev use_count, so blindly
+ * disabling a rail this driver did not enable steals someone else's enable
+ * reference (vgp1 is also claimed by the gt9xx touch driver). Calls are
+ * serialized by kdCam_Mutex.
+ */
+/* the front module hangs off the cam1_* pinctrl states, i.e. pin set 1 */
+#define S5K5E8_PIN_SET		1
+#define S5K5E8_RAIL_VCAMA	0x1
+#define S5K5E8_RAIL_SUBVCAMD	0x2
+#define S5K5E8_RAIL_VCAMIO	0x4
+#define S5K5E8_RAIL_VCAMD	0x8
+static unsigned int s5k5e8_rails_on;
+
+/*
+ * m5c: front-camera experiments, chosen per test kernel at build
+ * time (-DFORGE_S5K5E8_PDN_DEFAULT / -DFORGE_S5K5E8_VCAMD_DEFAULT) and
+ * readable in /sys/module/kernel/parameters/. The probe answers I2C_ACKERR
+ * with power, reset and MCLK as in the stock kdCISModulePowerOn.
+ *  forge_s5k5e8_pdn:   0 drive cam1 PDN low (since 9a241b972),
+ *                      1 drive it high, -1 leave it alone (stock never
+ *                      touches it in this branch).
+ *  forge_s5k5e8_vcamd: 1 also enable VCAMD at 1.2V - the stock DTB points
+ *                      vcamd_sub-supply at the vcamd LDO, the stock code
+ *                      uses vgp1; this powers both.
+ */
+#ifndef FORGE_S5K5E8_PDN_DEFAULT
+#define FORGE_S5K5E8_PDN_DEFAULT 0
+#endif
+#ifndef FORGE_S5K5E8_VCAMD_DEFAULT
+#define FORGE_S5K5E8_VCAMD_DEFAULT 0
+#endif
+static int forge_s5k5e8_pdn = FORGE_S5K5E8_PDN_DEFAULT;
+core_param(forge_s5k5e8_pdn, forge_s5k5e8_pdn, int, 0444);
+static int forge_s5k5e8_vcamd = FORGE_S5K5E8_VCAMD_DEFAULT;
+core_param(forge_s5k5e8_vcamd, forge_s5k5e8_vcamd, int, 0444);
+extern void forge_cam_rail_report(const char *tag);
+
 int kdCISModulePowerOn(enum CAMERA_DUAL_CAMERA_SENSOR_ENUM SensorIdx, char *currSensorName, bool On,
 		       char *mode_name)
 {
@@ -330,6 +376,14 @@ int kdCISModulePowerOn(enum CAMERA_DUAL_CAMERA_SENSOR_ENUM SensorIdx, char *curr
 		pinSetIdx = 1;
 	 else if (DUAL_CAMERA_MAIN_2_SENSOR == SensorIdx)
 		pinSetIdx = 2;
+
+	/* m5c: visible entry marker - every other print in this
+	 * function is pr_debug and the previous bring-up round could not even
+	 * tell from dmesg whether this function runs. One line per call.
+	 */
+	pr_info("[kd_camera_hw] power %s pinSetIdx=%d sensor=%s\n",
+		On ? "ON" : "OFF", pinSetIdx,
+		currSensorName ? currSensorName : "(null)");
 
 	if (On) {
 		if(currSensorName &&
@@ -944,6 +998,141 @@ int kdCISModulePowerOn(enum CAMERA_DUAL_CAMERA_SENSOR_ENUM SensorIdx, char *curr
 			mdelay(5);
 //+add by ontim
                     }
+		/* m5c: front S5K5E8 module. The stock Flyme kernel powers
+		 * it in a dedicated branch (kdCISModulePowerOn @ 0xffffffc0005bd318
+		 * in the stock vmlinux.elf): both resets low -> VCAMA 2.8V ->
+		 * VGP1 1.2V (the sub sensor digital core, NOT VCAMD) -> VCAMIO
+		 * 1.8V -> RST1 high -> MCLK on. CMPDN1 is never driven and
+		 * VCAMD / VCAMAF are never enabled for this sensor. The generic
+		 * branch below powered the wrong core rail (VCAMD @ 1.5V) and
+		 * left the real one (VGP1) untouched, so the sensor NACKed on
+		 * every i2c address. SUB_VCAMD resolves to vgp1 in
+		 * Get_Cam_Regulator().
+		 */
+                    else if (currSensorName && pinSetIdx == S5K5E8_PIN_SET
+			   && ((0 == strcmp(SENSOR_DRVNAME_S5K5E8_ST_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8_QH_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8_HOLITECH_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8_SUNWIN_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8YX_MIPI_RAW, currSensorName)))) {
+			/*
+			 * m5c, 2026-10-06: sub socket only again, as the
+			 * stock kdCISModulePowerOn ("cmp w19, #1; b.ne <generic>").
+			 * Since the module answers at its real address (0x30,
+			 * c2c7849f4) the MAIN search pass, which tries the S5K5E8
+			 * entries first, found it too and the HAL took the front
+			 * module as the back camera (kernel G). On the main socket
+			 * the S5K5E8 entries now take the generic branch, which
+			 * powers the main module (kernel K: front held in reset, so
+			 * 0x30 NACKs) and the entry is declined. (Declining
+			 * without power, kernel I, left the bus unpowered and every
+			 * id read ran into a 4 s i2c timeout - no camera at all.)
+			 */
+			/*
+			 * m5c: power the front module whenever ITS driver
+			 * is the one being probed, whatever socket the HAL named.
+			 *
+			 * Stock gates this branch on pinSetIdx == 1 (vmlinux
+			 * 0x5bc044: "cmp w19,#1; b.ne <generic>") because on stock
+			 * the HAL's second search pass really did arrive with
+			 * socket 2. Here it never does: the sub pass shows up as
+			 * SET_DRIVER slot1 socket=2 drvIdx=255, i.e. an empty
+			 * slot, so with that gate the front sensor is only ever
+			 * probed from the MAIN pass - through the generic branch,
+			 * which powers VCAMD 1.5V (the wrong rail for this module)
+			 * and drives cam0's reset. Live result: the sensor ACKs on
+			 * 0x78 with no bus error but reads back id 0x0, exactly
+			 * what an addressable-but-held-in-reset sensor looks like.
+			 *
+			 * So key the branch on the driver name and always drive the
+			 * front module's own pins (set 1), regardless of pinSetIdx.
+			 * The main sensor's reset is pulled low first either way,
+			 * so only one of the two ever answers on the shared bus.
+			 */
+			pr_info("[kd_camera_hw] s5k5e8 stock power branch (sub pins, called with pinSetIdx=%d)\n",
+				pinSetIdx);
+
+			/* keep the (unpowered) main sensor off the shared i2c bus,
+			 * exactly as stock does */
+			mtkcam_gpio_set(0, CAMRST, GPIO_OUT_ZERO);
+
+			/*
+			 * m5c: take the front module out of power-down.
+			 *
+			 * Stock never touches CMPDN1 here, but stock also never
+			 * runs the generic branch for this sensor - here the
+			 * MAIN pass does, and that branch drives CMPDN of the
+			 * pin set it was called with. Leaving the line asserted
+			 * keeps the sensor asleep, which is exactly what the bus
+			 * reports: I2C_ACKERR on every address of its table
+			 * while power, reset and MCLK are all correct.
+			 */
+			if (forge_s5k5e8_pdn >= 0 && GPIO_CAMERA_INVALID !=
+			    pinSet[S5K5E8_PIN_SET][IDX_PS_CMPDN])
+				mtkcam_gpio_set(S5K5E8_PIN_SET, CAMPDN,
+						pinSet[S5K5E8_PIN_SET][IDX_PS_CMPDN +
+						(forge_s5k5e8_pdn ? IDX_PS_ON : IDX_PS_OFF)]);
+			pr_info("[kd_camera_hw] s5k5e8: pdn mode %d, extra vcamd %d\n",
+				forge_s5k5e8_pdn, forge_s5k5e8_vcamd);
+
+			if (GPIO_CAMERA_INVALID != pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST])
+				mtkcam_gpio_set(S5K5E8_PIN_SET, CAMRST,
+						pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST + IDX_PS_OFF]);
+
+			mdelay(1);
+
+			/* VCAM_A */
+			if (TRUE != _hwPowerOnCnt(VCAMA, VOL_2800, mode_name)) {
+				pr_err("[kd_camera_hw] s5k5e8: Fail to enable analog power (VCAM_A)\n");
+				goto _kdCISModulePowerOn_exit_;
+			}
+			s5k5e8_rails_on |= S5K5E8_RAIL_VCAMA;
+
+			mdelay(1);
+
+			/* digital core from VGP1 @ 1.2V, as in stock */
+			if (TRUE != _hwPowerOnCnt(SUB_VCAMD, VOL_1200, mode_name)) {
+				pr_err("[kd_camera_hw] s5k5e8: Fail to enable digital power (SUB_VCAMD/vgp1)\n");
+				/* m5c: back out, or every 5s HAL retry leaks
+				 * one VCAMA enable ref (seen live: vcama stuck at
+				 * users=1 between probes) */
+				if (TRUE == _hwPowerDownCnt(VCAMA, mode_name))
+					s5k5e8_rails_on &= ~S5K5E8_RAIL_VCAMA;
+				goto _kdCISModulePowerOn_exit_;
+			}
+			s5k5e8_rails_on |= S5K5E8_RAIL_SUBVCAMD;
+
+			mdelay(1);
+
+			/* VCAM_IO */
+			if (TRUE != _hwPowerOnCnt(VCAMIO, VOL_1800, mode_name)) {
+				pr_err("[kd_camera_hw] s5k5e8: Fail to enable IO power (VCAM_IO)\n");
+				if (TRUE == _hwPowerDownCnt(SUB_VCAMD, mode_name))
+					s5k5e8_rails_on &= ~S5K5E8_RAIL_SUBVCAMD;
+				if (TRUE == _hwPowerDownCnt(VCAMA, mode_name))
+					s5k5e8_rails_on &= ~S5K5E8_RAIL_VCAMA;
+				goto _kdCISModulePowerOn_exit_;
+			}
+			s5k5e8_rails_on |= S5K5E8_RAIL_VCAMIO;
+
+			if (forge_s5k5e8_vcamd) {
+				if (TRUE == _hwPowerOnCnt(VCAMD, VOL_1200, mode_name))
+					s5k5e8_rails_on |= S5K5E8_RAIL_VCAMD;
+				else
+					pr_err("[kd_camera_hw] s5k5e8: Fail to enable VCAMD 1.2V (experiment)\n");
+			}
+
+			mdelay(2);
+
+			if (GPIO_CAMERA_INVALID != pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST])
+				mtkcam_gpio_set(S5K5E8_PIN_SET, CAMRST,
+						pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST + IDX_PS_ON]);
+
+			mdelay(1);
+			/* stock turns MCLK on at this point; ISP_MCLK1_EN(1)
+			 * already ran at the top of this function */
+			forge_cam_rail_report("s5k5e8 on");
+                    }
                     else {
 
 			/* First Power Pin low and Reset Pin Low */
@@ -955,6 +1144,26 @@ int kdCISModulePowerOn(enum CAMERA_DUAL_CAMERA_SENSOR_ENUM SensorIdx, char *curr
 			if (GPIO_CAMERA_INVALID != pinSet[pinSetIdx][IDX_PS_CMRST]) {
 				mtkcam_gpio_set(pinSetIdx, CAMRST,
 						pinSet[pinSetIdx][IDX_PS_CMRST + IDX_PS_OFF]);
+			}
+			/*
+			 * m5c, kernel K: an S5K5E8 entry probed on the MAIN
+			 * socket. Stock sends it here as well (pinSetIdx 0 only
+			 * special-cases the S5K4H8 names), so the main module gets
+			 * its normal power. But nothing drives the front module's
+			 * reset before the sub pass: on kernel J the very first
+			 * main-pass probe found RST1 high, the front module ACKed at
+			 * 0x30 with 0x5e80 and the HAL bound camera 0 to the s5k5e8
+			 * driver (FAILED_OPEN_4). Hold the front module in reset so
+			 * the main pass cannot see it; its own branch raises RST1
+			 * again on the sub pass. Main socket power is unchanged.
+			 */
+			if (pinSetIdx == 0 && currSensorName
+			    && (0 == strncmp(currSensorName, "s5k5e8", 6))
+			    && GPIO_CAMERA_INVALID != pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST]) {
+				pr_info("[kd_camera_hw] main pass %s: front module held in reset\n",
+					currSensorName);
+				mtkcam_gpio_set(S5K5E8_PIN_SET, CAMRST,
+						pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST + IDX_PS_OFF]);
 			}
 			/* VCAM_IO */
 			if (TRUE != _hwPowerOnCnt(VCAMIO, VOL_1800, mode_name)) {
@@ -1385,6 +1594,85 @@ int kdCISModulePowerOn(enum CAMERA_DUAL_CAMERA_SENSOR_ENUM SensorIdx, char *curr
 				goto _kdCISModulePowerOn_exit_;
 			}
 //-add by ontim
+		}
+		/* m5c: mirror of the s5k5e8 power-on branch above - only
+		 * the three rails it enabled may be released here, otherwise the
+		 * regulator enable counts underflow. Stock order: MCLK off (done
+		 * in the common tail below), RST low, VGP1/VCAMIO/VCAMA off.
+		 */
+                    else if (currSensorName && pinSetIdx == S5K5E8_PIN_SET
+			   && ((0 == strcmp(SENSOR_DRVNAME_S5K5E8_ST_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8_QH_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8_HOLITECH_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8_SUNWIN_MIPI_RAW, currSensorName))
+			   || (0 == strcmp(SENSOR_DRVNAME_S5K5E8YX_MIPI_RAW, currSensorName)))) {
+			/*
+			 * m5c, 2026-10-06: sub socket only again, as the
+			 * stock kdCISModulePowerOn ("cmp w19, #1; b.ne <generic>").
+			 * Since the module answers at its real address (0x30,
+			 * c2c7849f4) the MAIN search pass, which tries the S5K5E8
+			 * entries first, found it too and the HAL took the front
+			 * module as the back camera (kernel G). On the main socket
+			 * the S5K5E8 entries now take the generic branch, which
+			 * powers the main module (kernel K: front held in reset, so
+			 * 0x30 NACKs) and the entry is declined. (Declining
+			 * without power, kernel I, left the bus unpowered and every
+			 * id read ran into a 4 s i2c timeout - no camera at all.)
+			 */
+			/* m5c: mirrors the ON branch, which is keyed on the
+			 * driver name rather than the socket -
+			 * a MAIN-socket pass powered up via the generic branch and
+			 * must be released by the generic branch. */
+
+			if (GPIO_CAMERA_INVALID != pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST])
+				mtkcam_gpio_set(S5K5E8_PIN_SET, CAMRST,
+						pinSet[S5K5E8_PIN_SET][IDX_PS_CMRST + IDX_PS_OFF]);
+
+			mdelay(1);
+
+			/* m5c: release ONLY the rails the ON branch
+			 * enabled (mask above) - a blind disable after a failed
+			 * probe would steal the gt9xx touch driver's vgp1 enable
+			 * reference. Try every owed rail even if one trips.
+			 */
+			{
+				int pwr_fail = 0;
+
+				if (s5k5e8_rails_on & S5K5E8_RAIL_VCAMD) {
+					if (TRUE == _hwPowerDownCnt(VCAMD, mode_name))
+						s5k5e8_rails_on &= ~S5K5E8_RAIL_VCAMD;
+					else {
+						pr_err("[kd_camera_hw] s5k5e8: Fail to OFF VCAMD (experiment)\n");
+						pwr_fail = 1;
+					}
+				}
+				if (s5k5e8_rails_on & S5K5E8_RAIL_VCAMIO) {
+					if (TRUE == _hwPowerDownCnt(VCAMIO, mode_name))
+						s5k5e8_rails_on &= ~S5K5E8_RAIL_VCAMIO;
+					else {
+						pr_err("[kd_camera_hw] s5k5e8: Fail to OFF IO power (VCAM_IO)\n");
+						pwr_fail = 1;
+					}
+				}
+				if (s5k5e8_rails_on & S5K5E8_RAIL_SUBVCAMD) {
+					if (TRUE == _hwPowerDownCnt(SUB_VCAMD, mode_name))
+						s5k5e8_rails_on &= ~S5K5E8_RAIL_SUBVCAMD;
+					else {
+						pr_err("[kd_camera_hw] s5k5e8: Fail to OFF digital power (SUB_VCAMD/vgp1)\n");
+						pwr_fail = 1;
+					}
+				}
+				if (s5k5e8_rails_on & S5K5E8_RAIL_VCAMA) {
+					if (TRUE == _hwPowerDownCnt(VCAMA, mode_name))
+						s5k5e8_rails_on &= ~S5K5E8_RAIL_VCAMA;
+					else {
+						pr_err("[kd_camera_hw] s5k5e8: Fail to OFF analog power (VCAM_A)\n");
+						pwr_fail = 1;
+					}
+				}
+				if (pwr_fail)
+					goto _kdCISModulePowerOn_exit_;
+			}
 		}
                     else
 		{

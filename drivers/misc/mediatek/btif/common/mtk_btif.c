@@ -1331,7 +1331,14 @@ int _btif_rx_dma_setup(struct _mtk_btif_ *p_btif)
 		return _btif_rx_pio_setup(p_btif);
 	}
 /*hardware init*/
-	hal_btif_dma_hw_init(p_dma_info);
+	i_ret = hal_btif_dma_hw_init(p_dma_info);
+	if (i_ret) {
+		BTIF_ERR_FUNC("hal_btif_dma_hw_init failed, i_ret(%d),"
+			"set rx to pio mode\n", i_ret);
+		hal_btif_dma_clk_ctrl(p_dma_info, CLK_OUT_DISABLE);
+/*DMA hw init failed set Rx to PIO mode*/
+		return _btif_rx_pio_setup(p_btif);
+	}
 
 	hal_btif_dma_rx_cb_reg(p_dma_info,
 			       (dma_rx_buf_write) btif_dma_rx_data_receiver);
@@ -1389,7 +1396,17 @@ int _btif_tx_dma_setup(struct _mtk_btif_ *p_btif)
 		return i_ret;
 	}
 /*DMA controller setup*/
-	hal_btif_dma_hw_init(p_dma_info);
+	i_ret = hal_btif_dma_hw_init(p_dma_info);
+	if (i_ret) {
+		BTIF_ERR_FUNC("hal_btif_dma_hw_init failed, i_ret(%d),"
+			"set tx to pio mode\n", i_ret);
+
+#if !(MTK_BTIF_ENABLE_CLK_REF_COUNTER)
+		hal_btif_dma_clk_ctrl(p_dma_info, CLK_OUT_DISABLE);
+#endif
+
+		return _btif_tx_pio_setup(p_btif);
+	}
 
 /*DMA HW Enable*/
 	i_ret = hal_btif_dma_ctrl(p_dma_info, DMA_CTRL_ENABLE);

@@ -29,6 +29,9 @@
 #include <linux/sched.h>
 #include <linux/init.h>
 #include <linux/cpu.h>
+
+/* m5c DIAGNOSTIC (defined in arch/arm64/kernel/setup.c) */
+extern void forge_kmark_ptr(int ms, unsigned long v);
 #include <linux/cpufreq.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
@@ -2718,6 +2721,12 @@ static int _mt_cpufreq_set_locked(struct mt_cpu_dvfs *p, unsigned int cur_khz,
 
 	FUNC_ENTER(FUNC_LV_HELP);
 
+	/* m5c DIAGNOSTIC: every DVFS transition brackets as
+	 * slot70 (target_khz, on entry) / slot71 (volt, on exit). If the
+	 * 4.6s whole-SoC freeze ever shows 70 without 71, the wedge is
+	 * inside set_cur_volt/set_cur_freq (Vproc brownout suspect). */
+	forge_kmark_ptr(70, target_khz);
+
 	volt = _mt_cpufreq_search_available_volt(p, target_khz);
 
 #ifdef CONFIG_CPU_DVFS_TURBO_MODE
@@ -2814,6 +2823,8 @@ static int _mt_cpufreq_set_locked(struct mt_cpu_dvfs *p, unsigned int cur_khz,
 
 	FUNC_EXIT(FUNC_LV_HELP);
 out:
+	/* m5c: closing bracket of slot 70 (see entry above) */
+	forge_kmark_ptr(71, volt);
 	return ret;
 }
 
@@ -2981,8 +2992,19 @@ static unsigned int _mt_cpufreq_calc_new_opp_idx(struct mt_cpu_dvfs *p, int new_
 		cpufreq_ver("%s(): thermal/DLPT limited freq, idx = %d\n", __func__, new_opp_idx);
 	}
 
-	/* for early suspend */
-	if (p->dvfs_disable_by_early_suspend) {
+	/*
+	 * for early suspend
+	 *
+	 * m5c: the early-suspend OPP (fixed ~1GHz, or at least the
+	 * boot OPP) exists so that deep idle can drive Vproc from a known
+	 * point while the LCM is off (_allow_dpidle_ctrl_vproc). With the SPM
+	 * low-power gate closed (mt_spm.forge_spm_lowpower=0, journal
+	 *  7.43) there is no dpidle, no SODI and no
+	 * suspend, and the pin only kept the CPU at 1027 MHz for every
+	 * screen-off hour (set 32: ~82 h in time_in_state). Apply it only
+	 * while the gate is open; otherwise the governor decides.
+	 */
+	if (p->dvfs_disable_by_early_suspend && spm_load_firmware_status()) {
 		if (is_fix_freq_in_ES) {
 			/* Fix at about 1GHz to fix OGG Vorbis Playback noise issue */
 			idx =
@@ -4070,7 +4092,7 @@ static void _mt_cpufreq_lcm_status_switch(int onoff)
 
 			p->dvfs_disable_by_early_suspend = false;
 
-			if (is_fix_freq_in_ES) {
+			if (is_fix_freq_in_ES && spm_load_firmware_status()) {
 #ifdef CONFIG_CPU_FREQ
 				struct cpufreq_policy *policy = cpufreq_cpu_get(p->cpu_id);
 
@@ -4097,7 +4119,7 @@ static void _mt_cpufreq_lcm_status_switch(int onoff)
 
 			p->idx_opp_tbl_for_late_resume = p->idx_opp_tbl;
 
-			if (is_fix_freq_in_ES) {
+			if (is_fix_freq_in_ES && spm_load_firmware_status()) {
 #ifdef CONFIG_CPU_FREQ
 				struct cpufreq_policy *policy = cpufreq_cpu_get(p->cpu_id);
 

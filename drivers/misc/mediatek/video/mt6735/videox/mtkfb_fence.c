@@ -1108,6 +1108,16 @@ static int prepare_ion_buf(struct disp_buffer_info *buf, struct mtkfb_fence_buf_
  * @buf struct @fb_overlay_buffer
  * @return struct @mtkfb_fence_buf_info
  */
+/* display lane: born-signalled release-fence counters, see the note
+ * inside disp_sync_prepare_buf().  Always on, printed once per 512 prepares.
+ */
+static unsigned int forge_bs_total;
+static unsigned int forge_bs_born;
+static unsigned int forge_bs_lead1;
+static unsigned int forge_bs_lead2;
+static unsigned int forge_bs_lead3p;
+static int forge_bs_lead_min = 0x7fffffff;
+
 struct mtkfb_fence_buf_info *disp_sync_prepare_buf(struct disp_buffer_info *buf)
 {
 	int ret = 0;
@@ -1146,6 +1156,38 @@ struct mtkfb_fence_buf_info *disp_sync_prepare_buf(struct disp_buffer_info *buf)
 	data.fence = MTK_FB_INVALID_FENCE_FD;
 	data.value = ++(layer_info->fence_idx);
 	mutex_unlock(&(layer_info->sync_lock));
+
+	/* display lane, 2026-09-03: H-transport probe for the tearing
+	 * lane.  A layer fence is created at the absolute point data.value
+	 * while the timeline signals by increment, so the fence is ALREADY
+	 * signalled at birth whenever timeline->value >= data.value.  If that
+	 * happens the producer's wait is decorative: it gets the buffer back
+	 * while the display may still be scanning it, which is exactly the
+	 * shape the tearing lane is left with after the release-timing
+	 * hypothesis was rejected by A/B (hard/motion 21.6 vs 22.6 percent).
+	 * lead = how far ahead of the signalled point the new fence sits;
+	 * lead <= 0 is born-signalled, lead == 1 is "next in line".
+	 */
+	if (layer_info->timeline) {
+		int lead = (int)data.value - layer_info->timeline->value;
+
+		forge_bs_total++;
+		if (lead <= 0)
+			forge_bs_born++;
+		else if (lead == 1)
+			forge_bs_lead1++;
+		else if (lead == 2)
+			forge_bs_lead2++;
+		else
+			forge_bs_lead3p++;
+		if (lead < forge_bs_lead_min)
+			forge_bs_lead_min = lead;
+		if ((forge_bs_total % 512) == 0)
+			pr_info("forge-bornsig: total=%u born=%u lead1=%u lead2=%u lead3p=%u lead_min=%d\n",
+				forge_bs_total, forge_bs_born, forge_bs_lead1,
+				forge_bs_lead2, forge_bs_lead3p,
+				forge_bs_lead_min);
+	}
 
 	snprintf(data.name, sizeof(data.name), "disp-S%x-L%d-%d", session_id, timeline_id,
 		 data.value);

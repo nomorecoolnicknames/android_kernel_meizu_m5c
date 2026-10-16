@@ -472,6 +472,21 @@ int ovl_layer_switch(enum DISP_MODULE_ENUM module, unsigned layer, unsigned int 
 	return 0;
 }
 
+/* tear-probe (2026-08-28): direct-link value for the per-layer
+ * OVL_RDMAn_MEM_GMC_SETTING (internal fetch-DMA ultra thresholds).
+ * Stock was 0x6070 and left the fetch engines starving: 264 underflow
+ * hits per 2040 INTSTA samples over a 10s scripted scroll.  0x50FF
+ * (ultra request whenever the FIFO has room - the same value this very
+ * driver programs in decouple mode, so it is a proven-valid setting for
+ * this engine on this bus) measured 1 hit per 10s under the same scroll
+ * with the SMI golden config in place, and zero side effects were seen.
+ * The display is the only hard-realtime master here and its worst-case
+ * appetite is bounded (~0.9GB/s at 4 full-screen ARGB layers), so
+ * holding ultra permanently costs other masters little and buys the
+ * panel path immunity to concurrency.  Default since 2026-08-29;
+ * debugfs "forgegmc:HEX" still overrides live (stock A/B: 6070). */
+unsigned int forge_ovl_gmc_dl = 0x50FF;
+
 static int ovl_layer_config(enum DISP_MODULE_ENUM module, unsigned int layer,
 			    unsigned int source, enum DP_COLOR_ENUM format,
 			    unsigned long addr, unsigned int src_x,	/* ROI x offset */
@@ -639,10 +654,10 @@ static int ovl_layer_config(enum DISP_MODULE_ENUM module, unsigned int layer,
 	if (idx == 0) {
 		if (primary_display_is_decouple_mode() == 0) {
 			if (DISP_REG_GET(DISP_REG_OVL_RDMA0_MEM_GMC_SETTING + layer_offset) !=
-			    0x6070)
+			    forge_ovl_gmc_dl)
 				DISP_REG_SET(handle,
 					     DISP_REG_OVL_RDMA0_MEM_GMC_SETTING + layer_offset,
-					     0x6070);
+					     forge_ovl_gmc_dl);
 		} else {
 			if (DISP_REG_GET(DISP_REG_OVL_RDMA0_MEM_GMC_SETTING + layer_offset) !=
 			    0x50FF)
@@ -655,10 +670,10 @@ static int ovl_layer_config(enum DISP_MODULE_ENUM module, unsigned int layer,
 		if (primary_display_is_decouple_mode() == 0
 		    && ovl_get_status() != DDP_OVL1_STATUS_SUB) {
 			if (DISP_REG_GET(DISP_REG_OVL_RDMA0_MEM_GMC_SETTING + layer_offset) !=
-			    0x6070)
+			    forge_ovl_gmc_dl)
 				DISP_REG_SET(handle,
 					     DISP_REG_OVL_RDMA0_MEM_GMC_SETTING + layer_offset,
-					     0x6070);
+					     forge_ovl_gmc_dl);
 		} else {
 			if (DISP_REG_GET(DISP_REG_OVL_RDMA0_MEM_GMC_SETTING + layer_offset) !=
 			    0x50FF)

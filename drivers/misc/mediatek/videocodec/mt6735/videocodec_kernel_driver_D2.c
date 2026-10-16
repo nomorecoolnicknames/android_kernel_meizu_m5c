@@ -2740,7 +2740,7 @@ static long vcodec_unlocked_compat_ioctl(struct file *file, unsigned int cmd, un
 				return -EFAULT;
 
 			err =
-			    compat_copy_struct(struct VAL_VCODEC_OAL_HW_REGISTER_TYPE, COPY_FROM_USER,
+			    compat_copy_struct(VAL_VCODEC_OAL_HW_REGISTER_TYPE, COPY_FROM_USER,
 					       (void *)data32, (void *)data);
 
 			pHWStatus32 = (COMPAT_VAL_VCODEC_OAL_MEM_STAUTS_T *)data->pHWStatus;

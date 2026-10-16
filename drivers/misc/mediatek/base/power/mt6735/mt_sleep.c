@@ -272,7 +272,7 @@ static int slp_suspend_ops_enter(suspend_state_t state)
 		}
 
 #if !defined(CONFIG_FPGA_EARLY_PORTING)
-	if (!spm_load_firmware_status()) {
+	if (!spm_suspend_firmware_status()) {
 		slp_error("SPM FIRMWARE IS NOT READY\n");
 		ret = -EPERM;
 		goto LEAVE_SLEEP;
@@ -289,6 +289,10 @@ static int slp_suspend_ops_enter(suspend_state_t state)
 #endif
 */
 		slp_wake_reason = spm_go_to_sleep(slp_spm_flags, slp_spm_data);
+
+	/* an SPM poll that timed out closed the gate: the SoC never slept */
+	if (!spm_suspend_firmware_status())
+		ret = -EBUSY;
 
 LEAVE_SLEEP:
 #ifdef CONFIG_MTKPASR

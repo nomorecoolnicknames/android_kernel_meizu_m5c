@@ -83,6 +83,20 @@ static unsigned long cirq_pattern_clone_flush_check_val;
 static unsigned long cirq_pattern_list;
 
 /*
+ * The SPM suspend, dpidle and sodi paths call the exported functions
+ * unconditionally. If init failed, SYS_CIRQ_BASE is NULL and CIRQ_CON
+ * resolves to address 0x300: an oops in the idle loop.
+ */
+static bool mt_cirq_ready(void)
+{
+	if (likely(SYS_CIRQ_BASE))
+		return true;
+
+	pr_err_once("[CIRQ] not initialised, SYS_CIRQ left untouched\n");
+	return false;
+}
+
+/*
  * mt_cirq_get_mask: Get the specified SYS_CIRQ mask
  * @cirq_num: the SYS_CIRQ number to get
  * @return:
@@ -127,8 +141,10 @@ void mt_cirq_ack_all(void)
 		/* if a irq is pending & not masked, don't ack it
 		 * , since cirq start irq might not be 32 aligned with gic,
 		 * need an exotic API to get proper vector of pending irq
+		 * (it takes a GIC id: cirq 32*i is CIRQ_TO_IRQ_NUM(32*i),
+		 * not CIRQ_SPI_START+32*i, which is one register short)
 		 */
-		pend_vec = mt_irq_get_pending_vec(CIRQ_SPI_START+i*32);
+		pend_vec = mt_irq_get_pending_vec(CIRQ_TO_IRQ_NUM(i * 32));
 		mask_vec = mt_cirq_get_mask_vec(i);
 		/* those should be acked are: "not (pending & not masked)",
 		 */
@@ -325,6 +341,8 @@ void mt_cirq_enable(void)
 {
 	unsigned int st;
 
+	if (!mt_cirq_ready())
+		return;
 
 	mt_cirq_ack_all();
 
@@ -369,6 +387,9 @@ void mt_cirq_disable(void)
 {
 	unsigned int st;
 
+	if (!mt_cirq_ready())
+		return;
+
 	st = readl(IOMEM(CIRQ_CON));
 	st &= ~(CIRQ_CON_EN << CIRQ_CON_EN_BITS);
 	mt_reg_sync_writel((st & CIRQ_CON_BITS_MASK), CIRQ_CON);
@@ -386,6 +407,9 @@ void mt_cirq_flush(void)
 #endif
 
 #ifdef CONFIG_FAST_CIRQ_CLONE_FLUSH
+	if (!mt_cirq_ready())
+		return;
+
 	cirq_fast_sw_flush();
 	mt_cirq_mask_all();
 	mt_cirq_ack_all();
@@ -400,6 +424,9 @@ void mt_cirq_flush(void)
 	unsigned int first_irq_flushedto;
 	unsigned int last_fluashed_cirq;
 	unsigned int last_irq_flushedto;
+
+	if (!mt_cirq_ready())
+		return;
 
 	if (cirq_pattern_clone_flush_check_val == 1) {
 		if (cirq_pattern_list < CIRQ_IRQ_NUM) {
@@ -816,6 +843,9 @@ static void cirq_fast_sw_flush(void)
  */
 void mt_cirq_clone_gic(void)
 {
+	if (!mt_cirq_ready())
+		return;
+
 #ifdef LATENCY_CHECK
 	clone_t1 = sched_clock();
 #endif
@@ -1116,9 +1146,22 @@ static irqreturn_t cirq_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+#ifdef CONFIG_OF
+/*
+ * The DTB appended to the M5c image is the stock one (Flyme 3.18), and
+ * its node says "mediatek,mt6735-sys_cirq", as the 3.18 driver expected.
+ * This tree's own mt6735m.dts says "mediatek,sys_cirq".
+ */
+static const struct of_device_id mt_cirq_of_match[] __initconst = {
+	{ .compatible = "mediatek,sys_cirq", },
+	{ .compatible = "mediatek,mt6735-sys_cirq", },
+	{},
+};
+#endif
+
 /*
  * mt_cirq_init: SYS_CIRQ init function
- * always return 0
+ * returns 0, or a negative errno with SYS_CIRQ_BASE left NULL
  */
 int __init mt_cirq_init(void)
 {
@@ -1131,24 +1174,32 @@ int __init mt_cirq_init(void)
 	pr_debug("[CIRQ] CIRQ init...\n");
 
 #ifdef CONFIG_OF
-	node = of_find_compatible_node(NULL, NULL, "mediatek,sys_cirq");
+	node = of_find_matching_node(NULL, mt_cirq_of_match);
 	if (!node) {
-		pr_debug("[CIRQ] find SYS_CIRQ node failed!!!\n");
-		return -1;
+		pr_err("[CIRQ] find SYS_CIRQ node failed!!!\n");
+		return -ENODEV;
 	}
-	SYS_CIRQ_BASE = of_iomap(node, 0);
-	pr_debug("[CIRQ] SYS_CIRQ_BASE = 0x%p\n", SYS_CIRQ_BASE);
-	WARN(!SYS_CIRQ_BASE,
-			"[CIRQ] unable to map SYS_CIRQ base registers!!!\n");
 
-	if (of_property_read_u32(node, "mediatek,cirq_num", &CIRQ_IRQ_NUM))
-		return -1;
+	/* read the geometry before mapping: a mapped base means usable */
+	if (of_property_read_u32(node, "mediatek,cirq_num", &CIRQ_IRQ_NUM)) {
+		pr_err("[CIRQ] no mediatek,cirq_num\n");
+		return -EINVAL;
+	}
 	pr_debug("[CIRQ] cirq_num = %d\n", CIRQ_IRQ_NUM);
 
 	if (of_property_read_u32(node, "mediatek,spi_start_offset",
-				&CIRQ_SPI_START))
-		return -1;
+				&CIRQ_SPI_START)) {
+		pr_err("[CIRQ] no mediatek,spi_start_offset\n");
+		return -EINVAL;
+	}
 	pr_debug("[CIRQ] spi_start_offset = %d\n", CIRQ_SPI_START);
+
+	SYS_CIRQ_BASE = of_iomap(node, 0);
+	pr_debug("[CIRQ] SYS_CIRQ_BASE = 0x%p\n", SYS_CIRQ_BASE);
+	if (!SYS_CIRQ_BASE) {
+		pr_err("[CIRQ] unable to map SYS_CIRQ base registers!!!\n");
+		return -ENOMEM;
+	}
 
 	sys_cirq_num = irq_of_parse_and_map(node, 0);
 	pr_debug("[CIRQ] sys_cirq_num = %d\n", sys_cirq_num);
@@ -1207,7 +1258,8 @@ int __init mt_cirq_init(void)
 	dump_cirq_events_mgr(&cirq_all_events);
 #endif
 #endif
-	pr_debug("### CIRQ init done. ###\n");
+	pr_info("[CIRQ] init done: cirq_num %u, spi_start_offset %u\n",
+		CIRQ_IRQ_NUM, CIRQ_SPI_START);
 
 	return 0;
 }

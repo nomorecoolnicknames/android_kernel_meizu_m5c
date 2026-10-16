@@ -1619,6 +1619,13 @@ long port_proxy_user_ioctl(struct port_proxy *proxy_p, int ch, unsigned int cmd,
 		}
 #endif
 	default:
+		/* m5c: name the request nobody handles. ccci_fsd dies on
+		 * "fail get CCCI_FS buffer index: 25" (ENOTTY) and then segfaults,
+		 * so the modem never gets its NVRAM and faults early - but the
+		 * kernel never said WHICH ioctl it refused. */
+		CCCI_ERROR_LOG(proxy_p->md_id, TAG,
+			"unhandled user ioctl ch=%d cmd=0x%08x (nr=%u size=%u dir=%u)\n",
+			ch, cmd, _IOC_NR(cmd), _IOC_SIZE(cmd), _IOC_DIR(cmd));
 		ret = -ENOTTY;
 		break;
 	}

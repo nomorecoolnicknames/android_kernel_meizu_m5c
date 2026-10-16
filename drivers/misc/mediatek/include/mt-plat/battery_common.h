@@ -425,4 +425,10 @@ extern void mt_usb_disconnect(void);
 
 
 
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+/* m5c: stock battery id - 0 ATL, 1 VEKEN, 2 SUNWODA, -1 unknown
+ * (battery_meter.c) */
+extern int forge_m5c_battery_id(void);
+#endif
+
 #endif				/* #ifndef BATTERY_COMMON_H */

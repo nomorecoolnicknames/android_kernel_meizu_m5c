@@ -78,6 +78,27 @@ static struct dentry *spm_file;
 static struct platform_device *pspmdev;
 static int dyna_load_pcm_done __nosavedata;
 
+/*
+ * on the M5c, SPM suspend with the CPU powered down never wakes
+ * (2026-09-30, hang after "[SPM] sec = 900"), and dpidle/sodi use the same
+ * SPM + CPU_SHUTDOWN path. Until that is understood, report the firmware
+ * as not ready to the three gates that consult it (mt_sleep.c suspend,
+ * mt_idle.c dpidle_can_enter and soidle_can_enter): the phone behaves as it
+ * did without the pcm files. The firmware itself still loads, so writing 1
+ * to /sys/module/mt_spm/parameters/forge_spm_lowpower opens the paths.
+ */
+static bool forge_spm_lowpower;
+module_param(forge_spm_lowpower, bool, 0644);
+
+/*
+ * m5c: system suspend alone. The hang above was ATF faulting on
+ * an unmapped footprint address (fixed in mt_cpuidle.c, coverage journal
+ * c26/c30); suspend through SPM now wakes. dpidle and sodi stay behind
+ * forge_spm_lowpower until they are tested. 1 = suspend allowed.
+ */
+static bool forge_spm_suspend = 1;
+module_param(forge_spm_suspend, bool, 0644);
+
 #if defined(CONFIG_MACH_MT6735)
 static char *dyna_load_pcm_path[] = {
 	[DYNA_LOAD_PCM_SUSPEND] = "pcm_suspend_1.bin",
@@ -306,6 +327,36 @@ static int spm_irq_register(void)
 	return r;
 }
 
+/*
+ * m5c: the PCM state left by a hang. A sleep test that dies in WFI
+ * ends in a watchdog reset, and the SPM keeps its registers across it if
+ * TOPRGU does not reset the SPM domain. Read them once, before this driver
+ * resets the PCM for vcore DVFS: PC (REG15) says where the PCM stood when
+ * the AP died - 0x23a/0x229 waiting for the CPU, 0x2c5 in the sleep wait,
+ * 0x387 in the vcore loop after a wake (stock pcm_suspend 20160311 map,
+ *  c18). Reads only.
+ */
+static void forge_spm_dump_postmortem(void)
+{
+	pr_warn("[SPM] forge postmortem pc 0x%x fsm 0x%x con0 0x%x con1 0x%x im_ptr 0x%x flags 0x%x\n",
+		spm_read(SPM_PCM_REG15_DATA), spm_read(SPM_PCM_FSM_STA), spm_read(SPM_PCM_CON0),
+		spm_read(SPM_PCM_CON1), spm_read(SPM_PCM_IM_PTR), spm_read(SPM_PCM_FLAGS));
+	pr_warn("[SPM] forge postmortem r0 0x%x r1 0x%x r6 0x%x r7 0x%x r12 0x%x r13 0x%x r14 0x%x\n",
+		spm_read(SPM_PCM_REG0_DATA), spm_read(SPM_PCM_REG1_DATA), spm_read(SPM_PCM_REG6_DATA),
+		spm_read(SPM_PCM_REG7_DATA), spm_read(SPM_PCM_REG12_DATA), spm_read(SPM_PCM_REG13_DATA),
+		spm_read(SPM_PCM_REG14_DATA));
+	pr_warn("[SPM] forge postmortem timer_val 0x%x timer_out 0x%x wdt_val 0x%x wdt_out 0x%x\n",
+		spm_read(SPM_PCM_TIMER_VAL), spm_read(SPM_PCM_TIMER_OUT),
+		spm_read(SPM_PCM_WDT_TIMER_VAL), spm_read(SPM_PCM_WDT_TIMER_OUT));
+	pr_warn("[SPM] forge postmortem isr 0x%x raw_sta 0x%x misc 0x%x res3 0x%x res4 0x%x dpd2 0x%x dpd3 0x%x\n",
+		spm_read(SPM_SLEEP_ISR_STATUS), spm_read(SPM_SLEEP_ISR_RAW_STA),
+		spm_read(SPM_SLEEP_WAKEUP_MISC), spm_read(SPM_PCM_RESERVE3), spm_read(SPM_PCM_RESERVE4),
+		spm_read(SPM_PCM_PASR_DPD_2), spm_read(SPM_PCM_PASR_DPD_3));
+	pr_warn("[SPM] forge postmortem pwr_sta 0x%x cpu0_pwr 0x%x idle_sta 0x%x\n",
+		spm_read(SPM_PWR_STATUS), spm_read(SPM_CA7_CPU0_PWR_CON),
+		spm_read(SPM_SLEEP_SUBSYS_IDLE_STA));
+}
+
 static void spm_register_init(void)
 {
 	unsigned long flags;
@@ -439,6 +490,8 @@ static void spm_register_init(void)
 		spm_irq_1, spm_irq_2, spm_irq_3);
 #endif /*!defined(CONFIG_ARCH_MT6570) && !defined(CONFIG_MACH_MT6580)*/
 #endif /*CONFIG_OF*/
+
+	forge_spm_dump_postmortem();
 
 	spin_lock_irqsave(&__spm_lock, flags);
 
@@ -599,6 +652,18 @@ int __init spm_module_init(void)
 #ifdef ENABLE_DYNA_LOAD_PCM	/* for dyna_load_pcm */
 static char *local_buf;
 static dma_addr_t local_buf_dma;
+/*
+ * m5c: the PCM code buffer comes from the
+ * "mediatek,spm-reserve-memory" reserved-memory node, but m5c boots the
+ * STOCK 3.18 DTB, which has no such node. local_buf_dma then stayed 0,
+ * the firmware was written through ioremap(0) and SPM_PCM_IM_PTR got a
+ * bogus address: the PCM ran no code, nothing (RTC, its own 5 s timer)
+ * ever woke the SoC and suspend hung in WFI until the watchdog
+ * (kernel L markers, 2026-10-06). Without the node, take the buffer from
+ * kernel pages, as 3.18 did with its static arrays, and clean the D-cache
+ * so the SPM fetch sees the code.
+ */
+static bool local_buf_pages;
 static const struct firmware *spm_fw[DYNA_LOAD_PCM_MAX];
 
 int spm_fw_count = -1;
@@ -629,6 +694,16 @@ int spm_load_pcm_firmware(struct platform_device *pdev)
 	if (dyna_load_pcm_done)
 		return err;
 
+	if (NULL == local_buf && !local_buf_dma) {
+		local_buf = (char *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+				get_order(PCM_FIRMWARE_SIZE * DYNA_LOAD_PCM_MAX));
+		if (local_buf) {
+			local_buf_pages = true;
+			local_buf_dma = virt_to_phys(local_buf);
+			pr_info("[SPM] no spm-reserve-memory node: PCM buffer from pages at 0x%llx\n",
+				(unsigned long long)local_buf_dma);
+		}
+	}
 	if (NULL == local_buf) {
 		local_buf = (char *)ioremap_nocache(local_buf_dma, PCM_FIRMWARE_SIZE * DYNA_LOAD_PCM_MAX);
 		if (!local_buf) {
@@ -668,7 +743,11 @@ int spm_load_pcm_firmware(struct platform_device *pdev)
 		copy_size = firmware_size * 4;
 		dyna_load_pcm[i].buf = local_buf + i * PCM_FIRMWARE_SIZE;
 		dyna_load_pcm[i].buf_dma = local_buf_dma + i * PCM_FIRMWARE_SIZE;
-		memcpy_toio(dyna_load_pcm[i].buf, fw->data + offset, copy_size);
+		if (local_buf_pages) {
+			memcpy(dyna_load_pcm[i].buf, fw->data + offset, copy_size);
+			__flush_dcache_area(dyna_load_pcm[i].buf, copy_size);
+		} else
+			memcpy_toio(dyna_load_pcm[i].buf, fw->data + offset, copy_size);
 		/* dmac_map_area((void *)dyna_load_pcm[i].buf, PCM_FIRMWARE_SIZE, DMA_TO_DEVICE); */
 
 		/* start of pcm_desc without pointer */
@@ -691,8 +770,11 @@ int spm_load_pcm_firmware(struct platform_device *pdev)
 		spm_fw_count++;
 	}
 
-	if (spm_fw_count == check_spm_fw_count)
+	if (spm_fw_count == check_spm_fw_count) {
 		dyna_load_pcm_done = 1;
+		if (!forge_spm_lowpower)
+			pr_info("[SPM] pcm firmware loaded; suspend/dpidle/sodi gated (forge_spm_lowpower=0)\n");
+	}
 
 	return err;
 }
@@ -707,9 +789,56 @@ int spm_load_pcm_firmware_nodev(void)
 	return 0;
 }
 
+/*
+ * m5c: reload the PCM code without a reboot, for trying another
+ * PCM generation on a test run. Write 1 after pointing
+ * /sys/module/firmware_class/parameters/path at a directory holding all
+ * four pcm_*_2.bin files. Only while the low-power gate is closed.
+ */
+static int forge_spm_reload_set(const char *val, const struct kernel_param *kp)
+{
+	int i;
+
+	if (forge_spm_lowpower || !pspmdev)
+		return -EBUSY;
+	for (i = DYNA_LOAD_PCM_SUSPEND; i < DYNA_LOAD_PCM_MAX; i++) {
+		dyna_load_pcm[i].ready = 0;
+		if (spm_fw[i]) {
+			release_firmware(spm_fw[i]);
+			spm_fw[i] = NULL;
+		}
+	}
+	dyna_load_pcm_done = 0;
+	spm_fw_count = 0;
+	spm_load_pcm_firmware(pspmdev);
+	pr_info("[SPM] forge reload: done=%d count=%d suspend=%s\n", dyna_load_pcm_done,
+		spm_fw_count, dyna_load_pcm[DYNA_LOAD_PCM_SUSPEND].ready ?
+		dyna_load_pcm[DYNA_LOAD_PCM_SUSPEND].desc.version : "(none)");
+	return 0;
+}
+
+static const struct kernel_param_ops forge_spm_reload_ops = {
+	.set = forge_spm_reload_set,
+};
+module_param_cb(forge_spm_reload, &forge_spm_reload_ops, NULL, 0200);
+
 int spm_load_firmware_status(void)
 {
-	return dyna_load_pcm_done;
+	return forge_spm_lowpower ? dyna_load_pcm_done : 0;
+}
+
+int spm_suspend_firmware_status(void)
+{
+	return (forge_spm_lowpower || forge_spm_suspend) ? dyna_load_pcm_done : 0;
+}
+
+/* a bounded SPM poll timed out; fail closed, as the gate does */
+void spm_forge_lowpower_trip(const char *what, u32 val)
+{
+	forge_spm_lowpower = false;
+	forge_spm_suspend = false;
+	pr_err("[SPM] %s = 0x%x: poll timed out, suspend/dpidle/sodi gated\n",
+	       what, val);
 }
 
 void *get_spm_firmware_version(uint32_t index)
@@ -844,7 +973,7 @@ static int spm_pm_event(struct notifier_block *notifier, unsigned long pm_event,
 		dyna_load_pcm_done = 0;
 		for (i = DYNA_LOAD_PCM_SUSPEND; i < DYNA_LOAD_PCM_MAX; i++)
 			dyna_load_pcm[i].ready = 0;
-		if (local_buf) {
+		if (local_buf && !local_buf_pages) {
 			iounmap(local_buf);
 			local_buf = NULL;
 		}

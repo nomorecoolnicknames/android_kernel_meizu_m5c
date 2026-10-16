@@ -57,7 +57,23 @@ ccflags-y += -I$(srctree)/drivers/misc/mediatek/base/power/$(MTK_PLATFORM)/
 ccflags-y += -DSMI_D2
 ccflags-y += -DMMDVFS_HOOK
 SUPPORT_QOS := false
+# m5c: P0 camera bring-up uses MTK's own mmdvfs bring-up
+# implementation (mmdvfs_mgr_default.c, marked "for bring up and test only")
+# because the full mmdvfs_mgr.c calls DISP_GetScreenWidth/Height, which only
+# exist with CONFIG_MTK_FB=y, and the display stack is off in this bring-up
+# (panel runs from LK). This is NOT a fake-success shim: DVFS is genuinely
+# absent, every call logs "for bringup" and returns safe defaults
+# (mmdvfs_get_stable_isp_clk reports MMSYS_CLK_HIGH).
+#
+# the display frontier is open now, so with CONFIG_MTK_FB=y take the
+# full manager as that comment intended. The video codec needs it: only
+# mmdvfs_mgr.c defines register_mmclk_switch_vdec_ctrl_cb, and without it the
+# combined image fails to link.
+ifeq ($(CONFIG_MTK_FB),y)
 obj-y += mmdvfs_mgr.o
+else
+obj-y += mmdvfs_mgr_default.o
+endif
 endif
 
 ifeq (true, $(SUPPORT_QOS))

@@ -33,6 +33,18 @@ config MTK_AUTO_POWER_ON_WITH_CHARGER
 	  support the boot behavior.
 
 
+config FORGE_M5C_BATTERY_PROFILE
+	bool "Meizu M5c: stock battery id, profiles and 4.35 V charging"
+	depends on MTK_SMART_BATTERY && MTK_FAN5405_SUPPORT
+	default n
+	help
+	  Reads the battery id the way the stock Flyme kernel does (bat_meter
+	  batidpin / idboardpin GPIOs) and, for a recognised battery (ATL,
+	  VEKEN, SUNWODA), uses the stock fuel-gauge profiles of that battery
+	  and charges to 4.34 V with the FAN5405 safety limit at 4.36 V, as
+	  the stock kernel does.  An unknown id keeps the MTK reference
+	  profile and 4.2 V.
+
 config MTK_SWCHR_SUPPORT
 	tristate "MediaTek switch charger"
 	default n

@@ -38,6 +38,7 @@
 #include <linux/smp.h>
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/memblock.h>
 #include <linux/of_fdt.h>
 #include <linux/efi.h>
@@ -231,6 +232,193 @@ static void __init request_standard_resources(void)
 
 u64 __cpu_logical_map[NR_CPUS] = { [0 ... NR_CPUS-1] = INVALID_HWID };
 
+/*
+ * C-level boot markers (m5c 4.9 bring-up, no console).
+ * The asm markers in head.S run with the MMU off and physical stores; once
+ * the MMU is on they cannot reach the far scratch pages. These stamp the
+ * same two validated scratch addresses (0x7f000000, 0xb0000000) from C via
+ * early_ioremap (available from early_ioremap_init() onward), so the death
+ * point can be bisected across setup_arch. Same on-DRAM layout as head.S:
+ * "FORGE49\0" at +0, an 8-byte slot per milestone at +8+8*ms (bytes
+ * ms,'A','R','A'), so every milestone reached stays visible.
+ * Milestones (C): 5=setup_arch/ioremap live, 6=fdt scanned,
+ * 7=memblock done, 8=paging_init done, 9=setup_arch end.
+ */
+#define FORGE_A	0x7f000000UL
+#define FORGE_B	0xb0000000UL
+
+static void __init forge_cmark(int ms)
+{
+	static const phys_addr_t bases[2] = { FORGE_A, FORGE_B };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		void __iomem *p = early_ioremap(bases[i], 128);
+
+		if (!p)
+			continue;
+		writel(0x47524f46, p + 0);		/* "FORG" */
+		writel(0x00393445, p + 4);		/* "E49\0" */
+		writeq(((u64)0x4152 << 16) | (0x4100 | (ms & 0xff)),
+		       p + 8 + 8 * ms);			/* slot: ms,'A','R','A' */
+		early_iounmap(p, 128);
+	}
+}
+
+/*
+ * forge_kmark: same markers but for the start_kernel phase, after
+ * early_ioremap is torn down. The linear map is up (post paging_init), so
+ * reach the scratch pages by phys_to_virt - but that mapping is CACHED, so
+ * the cacheline must be flushed to DRAM or the recovery /dev/mem read (which
+ * sees DRAM) would miss it if the CPU wedges. Milestones 10..16 are stamped
+ * from init/main.c around the init calls most likely to hang on this graft
+ * (init_IRQ = mt-gic, time_init = mt_gpt, console_init).
+ */
+void forge_kmark(int ms)
+{
+	unsigned long bases[2] = { FORGE_A, FORGE_B };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		void *p = phys_to_virt(bases[i]);
+
+		*(volatile u32 *)(p + 0) = 0x47524f46;		/* "FORG" */
+		*(volatile u32 *)(p + 4) = 0x00393445;		/* "E49\0" */
+		*(volatile u64 *)(p + 8 + 8 * ms) =
+			((u64)0x4152 << 16) | (0x4100 | (ms & 0xff));
+		__flush_dcache_area(p, 1024);	/* covers slots up to ms=126 */
+	}
+}
+
+/*
+ * forge_preserve_prev (p37): copy the previous boot's marker slots (bytes
+ * 0..1023 of each page) into bytes 1024..2047 of the SAME page, before this
+ * boot re-stamps them. In a reset loop every cycle overwrites the live
+ * slots; the copy keeps the dying boot's full history readable from TWRP
+ * (dd count=2) and mirrorable to expdb. head.S has already stamped slots
+ * 1-4 of the current boot by now — acceptable loss, everything from the
+ * ~5s window onward is still the previous boot's.
+ */
+static void __init forge_preserve_prev(void)
+{
+	unsigned long bases[2] = { FORGE_A, FORGE_B };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		void *p = phys_to_virt(bases[i]);
+
+		if (*(u32 *)p != 0x47524f46)	/* no "FORG" magic: cold boot */
+			continue;
+		memcpy(p + 1024, p, 1024);
+		__flush_dcache_area(p, 2048);
+	}
+}
+
+/*
+ * a one-shot flag cell at page A + 2048 — outside both the
+ * milestone slots (0..1023) and the previous-boot copy (1024..2047), inside
+ * the reserved page. DRAM survives the warm reset (DDR-reserve, p43), so a
+ * subsystem can mark "I am about to do something that killed the last boot"
+ * and see it again on the next boot. A cold boot wipes it (0xFF...) and the
+ * attempt is made afresh.
+ */
+u64 forge_flag_get(void)
+{
+	return *(volatile u64 *)(phys_to_virt(FORGE_A) + 2048);
+}
+EXPORT_SYMBOL(forge_flag_get);
+
+void forge_flag_set(u64 v)
+{
+	void *p = phys_to_virt(FORGE_A) + 2048;
+
+	*(volatile u64 *)p = v;
+	__flush_dcache_area(p, 64);
+}
+EXPORT_SYMBOL(forge_flag_set);
+
+/*
+ * forge_kmark_sec: secondary-CPU milestones (slots 272.., see head.S
+ * forge_mark_cpu). Called from __secondary_switched (MMU on, stack live,
+ * per-cpu offset NOT set yet) and secondary_start_kernel; must not touch
+ * per-cpu data. Flushes only its own cache line so it never writes back a
+ * stale copy of the lines the MMU-off asm stamps bypassed the cache with.
+ */
+void notrace forge_kmark_sec(int ms)
+{
+	unsigned long bases[2] = { FORGE_A, FORGE_B };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		void *p = phys_to_virt(bases[i]) + 8 + 8 * ms;
+
+		*(volatile u64 *)p =
+			((u64)0x4152 << 16) | (0x4200 | ((ms - 272) & 0xff));
+		__flush_dcache_area(p, 8);
+	}
+}
+
+/*
+ * /proc/forge_marks: dump every non-zero 8-byte cell of both marker pages
+ * so the live (possibly 1-CPU) kernel can be read over adb without TWRP.
+ * civac first: the secondary CPUs stamp with the MMU off (stores bypass
+ * the caches), so any clean-but-stale cached copy must be dropped.
+ */
+static int forge_marks_show(struct seq_file *m, void *v)
+{
+	unsigned long bases[2] = { FORGE_A, FORGE_B };
+	int i, j;
+
+	for (i = 0; i < 2; i++) {
+		void *p = phys_to_virt(bases[i]);
+
+		__flush_dcache_area(p, PAGE_SIZE);
+		seq_printf(m, "window %lx\n", bases[i]);
+		for (j = 0; j < PAGE_SIZE / 8; j++) {
+			u64 val = *(volatile u64 *)(p + 8 * j);
+
+			if (val)
+				seq_printf(m, "%4d %016llx\n", j - 1, val);
+		}
+	}
+	return 0;
+}
+
+static int forge_marks_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, forge_marks_show, NULL);
+}
+
+static const struct file_operations forge_marks_fops = {
+	.open		= forge_marks_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int __init forge_marks_proc_init(void)
+{
+	proc_create("forge_marks", 0444, NULL, &forge_marks_fops);
+	return 0;
+}
+late_initcall(forge_marks_proc_init);
+
+/* Like forge_kmark but the slot carries an arbitrary value (e.g. the
+ * address of the initcall about to run); decode with the build's
+ * System.map. */
+void forge_kmark_ptr(int ms, unsigned long v)
+{
+	unsigned long bases[2] = { FORGE_A, FORGE_B };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		void *p = phys_to_virt(bases[i]);
+
+		*(volatile u64 *)(p + 8 + 8 * ms) = v;
+		__flush_dcache_area(p, 1024);
+	}
+}
+
 void __init setup_arch(char **cmdline_p)
 {
 	pr_info("Boot CPU: AArch64 Processor [%08x]\n", read_cpuid_id());
@@ -245,8 +433,10 @@ void __init setup_arch(char **cmdline_p)
 
 	early_fixmap_init();
 	early_ioremap_init();
+	forge_cmark(5);				/* setup_arch, early_ioremap live */
 
 	setup_machine_fdt(__fdt_pointer);
+	forge_cmark(6);				/* FDT scanned */
 
 	parse_early_param();
 
@@ -265,8 +455,22 @@ void __init setup_arch(char **cmdline_p)
 	xen_early_init();
 	efi_init();
 	arm64_memblock_init();
+	/* the marker pages, the debug ram console window and the
+	 * debug pstore window are plain free DRAM as far as the allocator is
+	 * concerned (the stock DTB memory node ends at 0x5f000000, but LK
+	 * hands us the real 2GB, so they all sit in the linear map). Without
+	 * these reserves the buddy allocator hands them out and every
+	 * forge_kmark / ram_console write corrupts live kernel or user
+	 * memory.
+	 * av49: the three memblock_reserve()s moved INTO arm64_memblock_init()
+	 * (arch/arm64/mm/init.c, just before early_init_fdt_scan_reserved_mem)
+	 * so they precede the dynamic MD1 reserved-memory allocation. See the
+	 * comment there. */
+	forge_cmark(7);				/* memblock done */
 
 	paging_init();
+	forge_cmark(8);				/* paging_init done (linear map up) */
+	forge_preserve_prev();			/* save prev boot's slots */
 
 	acpi_table_upgrade();
 
@@ -315,6 +519,7 @@ void __init setup_arch(char **cmdline_p)
 			"This indicates a broken bootloader or old kernel\n",
 			boot_args[1], boot_args[2], boot_args[3]);
 	}
+	forge_cmark(9);				/* setup_arch end */
 }
 
 static int __init topology_init(void)

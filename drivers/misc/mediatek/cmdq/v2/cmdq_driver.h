@@ -81,6 +81,31 @@ struct cmdqWriteAddressStruct {
 /*  */
 #define CMDQ_IOCTL_ASYNC_JOB_EXEC                                              \
 	_IOW(CMDQ_IOCTL_MAGIC_NUMBER, 5, struct cmdqJobStruct)
+
+/* m5c (camera lane, 2026-09-03): the m5c userspace blobs were built
+ * against a cmdqCommandStruct WITHOUT the trailing userDebugStr /
+ * userDebugStrLen pair, so their cmdqJobStruct is 16 bytes shorter and the
+ * size baked into _IOW() does not match ours.  The kernel then rejects the
+ * call outright - "[CMDQ][ERR][COMPAT]unrecognized ioctl 0x40d87805" - MDP
+ * cannot submit its command block, its job queue fills (DP_STATUS_BUFFER_FULL),
+ * pass2 never starts and the camera preview shows an all-zero (green) buffer.
+ *
+ * Measured from the shipped kernel's DWARF, not guessed:
+ *   sizeof(struct cmdqJobStruct)          = 232   (ours)
+ *   offsetof(cmdqCommandStruct, userDebugStr) = 208
+ *   offsetof(cmdqJobStruct, hJob)         = 224
+ * so the blob layout is a strict PREFIX of ours: command truncated at 208,
+ * hJob at 208, total 216 - exactly the size seen on the wire.
+ *
+ * Same shape as the fix p48 made for CMDQ_IOCTL_QUERY_DTS below.  The
+ * number is derived from offsetof so it can never drift away from the struct.
+ */
+#define CMDQ_JOB_LEGACY_CMD_SIZE \
+	offsetof(struct cmdqCommandStruct, userDebugStr)
+#define CMDQ_JOB_LEGACY_SIZE \
+	(CMDQ_JOB_LEGACY_CMD_SIZE + sizeof(cmdqJobHandle_t))
+#define CMDQ_IOCTL_ASYNC_JOB_EXEC_LEGACY \
+	_IOC(_IOC_WRITE, CMDQ_IOCTL_MAGIC_NUMBER, 5, CMDQ_JOB_LEGACY_SIZE)
 #define CMDQ_IOCTL_ASYNC_JOB_WAIT_AND_CLOSE                                    \
 	_IOR(CMDQ_IOCTL_MAGIC_NUMBER, 6, struct cmdqJobResultStruct)
 
@@ -102,6 +127,10 @@ struct cmdqWriteAddressStruct {
 /*  */
 #define CMDQ_IOCTL_QUERY_DTS                                                   \
 	_IOW(CMDQ_IOCTL_MAGIC_NUMBER, 11, struct cmdqDTSDataStruct)
+
+/* 27-subsys layout the m5c userspace blobs were built against */
+#define CMDQ_IOCTL_QUERY_DTS_LEGACY                                            \
+	_IOW(CMDQ_IOCTL_MAGIC_NUMBER, 11, struct cmdqDTSDataStruct_legacy)
 
 /*  */
 /* Notify MDP will use specified engine before really use. */

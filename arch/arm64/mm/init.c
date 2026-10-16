@@ -343,6 +343,25 @@ void __init arm64_memblock_init(void)
 	}
 #endif
 
+	/*
+	 * p37/av49: reserve the debug windows BEFORE scanning the DT
+	 * reserved-memory nodes. The stock DTB carries a dynamic
+	 * reserve-memory-ccci_md1 (no-map, size 0x3810000 ~56MB, align 32MB,
+	 * alloc-ranges 0x40000000..), which early_init_fdt_scan_reserved_mem()
+	 * places for the modem regardless of whether the modem driver is
+	 * configured in. Its range covers all three of our marker windows, so
+	 * if MD1 is placed first it can straddle them and our ram console /
+	 * forge_kmark writes would corrupt live modem memory (and vice versa) —
+	 * a marker channel that lies silently. Reserving here, after memblock
+	 * has the real DRAM (memblock_add above) but before the reserved-mem
+	 * scan, makes MD1 step around these deterministically instead of
+	 * "usually top-down, probably clear". This is the p37 reserve moved up
+	 * from setup_arch(), where it ran after arm64_memblock_init() and thus
+	 * after the MD1 allocation. */
+	memblock_reserve(0x5f000000, 0x100000);	/* rc49 64K + pstore 0xe0000 */
+	memblock_reserve(0x7f000000, PAGE_SIZE);	/* marker page A */
+	memblock_reserve(0xb0000000, PAGE_SIZE);	/* marker page B */
+
 	early_init_fdt_scan_reserved_mem();
 
 	/* 4GB maximum for 32-bit only capable devices */

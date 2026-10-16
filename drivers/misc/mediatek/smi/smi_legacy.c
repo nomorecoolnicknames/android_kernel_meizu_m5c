@@ -681,6 +681,10 @@ static int smi_debug_dumpper(struct mtk_smi_dev *smi,
 	base = (mmsys ? mmsys->base : smi->base);
 	nr_debugs = (mmsys ? mmsys->nr_debugs : smi->nr_debugs);
 	debugs = (mmsys ? mmsys->debugs : smi->debugs);
+	/* m5c: mmsys dump may be disabled (no mmsys_config in the
+	 * stock DTB) - base and debugs are NULL then, nothing to print */
+	if (!base || !debugs || !nr_debugs)
+		return 0;
 	name = (mmsys ? "MMSYS" :
 		(smi->index == SMI_LARB_NUM ? "COMMON" : "LARB"));
 	ref_cnt = mtk_smi_clk_ref_cnts_read(smi);
@@ -1215,8 +1219,15 @@ static int smi_mmsys_offset_get(void)
 	smi_mmsys->base = (void *)of_iomap(of_node, 0);
 	of_node_put(of_node);
 	if (!smi_mmsys->base) {
-		SMIERR("Unable to parse or iomap mmsys_config\n");
-		return -ENOMEM;
+		/* m5c: the stock 2017 DTB smi_common node predates
+		 * the "mmsys_config" phandle binding.  The mapping is only
+		 * used by the debug dumper, so degrade to no mmsys dump
+		 * instead of failing smi_register (which would unregister
+		 * the whole SMI stack and drop the golden config again). */
+		SMIERR("mmsys_config missing in DT, mmsys debug dump disabled\n");
+		smi_mmsys->nr_debugs = 0;
+		smi_mmsys->debugs = NULL;
+		return 0;
 	}
 
 	smi_mmsys->nr_debugs = SMI_MMSYS_DEBUG_NUM;
@@ -1301,6 +1312,15 @@ int smi_register(struct platform_driver *drv)
 	spin_lock_init(&(smi_drv->lock));
 	smi_drv->scen = SMI_BWC_SCEN_NORMAL;
 	smi_drv->table[smi_drv->scen] += 1;
+
+	/* `larbs` is allocated by mtk_smi_common_probe (memory/
+	 * mtk-smi.c); when that probe fails the pointer is NULL and the loop
+	 * below dereferenced it at address 0 (p44 oops, PC=smi_register+0x88).
+	 * Fail the registration instead of taking the kernel down. */
+	if (!larbs || !common) {
+		SMIDBG("no SMI common/larb devices (probe failed)\n");
+		return -ENXIO;
+	}
 
 	/* COMMON and LARBs */
 	for (i = 0; i <= SMI_LARB_NUM; i++) {

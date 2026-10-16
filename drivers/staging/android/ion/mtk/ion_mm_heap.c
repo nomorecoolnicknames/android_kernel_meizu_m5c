@@ -54,6 +54,7 @@ struct ion_mm_buffer_info {
 	unsigned int iova_start;
 	unsigned int iova_end;
 	struct ion_mm_buf_debug_info dbg_info;
+	struct ion_mm_sf_buf_info sf_buf_info;
 	ion_mm_buf_destroy_callback_t *destroy_fn;
 	pid_t pid;
 };
@@ -1171,17 +1172,36 @@ long ion_mm_ioctl(struct ion_client *client, unsigned int cmd,
 	struct ion_mm_data param;
 	long ret = 0;
 	/* char dbgstr[256]; */
-	unsigned long ret_copy;
+	unsigned long ret_copy = 0;
 	unsigned int buffer_sec = 0;
 	enum ion_heap_type buffer_type = 0;
 	struct ion_buffer *buffer;
 	struct ion_handle *kernel_handle;
 
-	if (from_kernel)
+	/* The 2016 vendor blobs were built against this exact layout, and the
+	 * union is addressed by them at a fixed offset.  Adding a union member
+	 * whose alignment is wider than the current one would slide every
+	 * ION_MM_ command at once and break gralloc, imem_drv and the display
+	 * path together, silently.  Measured on the built vmlinux: struct is
+	 * 80 bytes, union starts at 8.  Gate it so the next member cannot
+	 * move it without the build saying so.
+	 */
+	BUILD_BUG_ON(sizeof(struct ion_mm_data) != 80);
+	BUILD_BUG_ON(offsetof(struct ion_mm_data, config_buffer_param) != 8);
+	BUILD_BUG_ON(offsetof(struct ion_mm_data, buf_debug_info_param) != 8);
+	BUILD_BUG_ON(offsetof(struct ion_mm_data, sf_buf_info_param) != 8);
+
+	if (from_kernel) {
 		param = *(struct ion_mm_data *)arg;
-	else
+	} else {
 		ret_copy = copy_from_user(&param, (void __user *)arg,
 					  sizeof(struct ion_mm_data));
+		if (ret_copy) {
+			IONMSG("%s copy_from_user short by %lu\n",
+			       __func__, ret_copy);
+			return -EFAULT;
+		}
+	}
 
 	switch (param.mm_cmd) {
 	case ION_MM_CONFIG_BUFFER:
@@ -1401,6 +1421,69 @@ long ion_mm_ioctl(struct ion_client *client, unsigned int cmd,
 		}
 		ion_drv_put_kernel_handle(kernel_handle);
 
+		break;
+	case ION_MM_SET_SF_BUF_INFO:
+	case ION_MM_GET_SF_BUF_INFO:
+		if (param.sf_buf_info_param.handle == 0) {
+			IONMSG(" Error. sf_buf_info with invalid handle\n");
+			ret = -EFAULT;
+			break;
+		}
+
+		kernel_handle = ion_drv_get_handle(client,
+						   param.sf_buf_info_param.
+						   handle,
+						   param.sf_buf_info_param.
+						   kernel_handle, from_kernel);
+		if (IS_ERR(kernel_handle)) {
+			IONMSG(" sf_buf_info fail! kernel_handle=0x%p\n",
+			       kernel_handle);
+			ret = -EINVAL;
+			break;
+		}
+
+		buffer = ion_handle_buffer(kernel_handle);
+		buffer_type = buffer->heap->type;
+		if ((int)buffer->heap->type == ION_HEAP_TYPE_MULTIMEDIA) {
+			struct ion_mm_buffer_info *buffer_info =
+			    buffer->priv_virt;
+
+			buffer_sec = buffer_info->security;
+			if (param.mm_cmd == ION_MM_SET_SF_BUF_INFO)
+				ion_mm_cp_sf_buf_info(&param.sf_buf_info_param,
+						      &buffer_info->sf_buf_info);
+			else
+				ion_mm_cp_sf_buf_info(&buffer_info->sf_buf_info,
+						      &param.sf_buf_info_param);
+		} else if ((int)buffer->heap->type == ION_HEAP_TYPE_FB) {
+			struct ion_fb_buffer_info *buffer_info =
+			    buffer->priv_virt;
+
+			buffer_sec = buffer_info->security;
+			if (param.mm_cmd == ION_MM_SET_SF_BUF_INFO)
+				ion_mm_cp_sf_buf_info(&param.sf_buf_info_param,
+						      &buffer_info->sf_buf_info);
+			else
+				ion_mm_cp_sf_buf_info(&buffer_info->sf_buf_info,
+						      &param.sf_buf_info_param);
+		} else if ((int)buffer->heap->type ==
+			   ION_HEAP_TYPE_MULTIMEDIA_SEC) {
+			struct ion_sec_buffer_info *buffer_info =
+			    buffer->priv_virt;
+
+			buffer_sec = buffer_info->security;
+			if (param.mm_cmd == ION_MM_SET_SF_BUF_INFO)
+				ion_mm_cp_sf_buf_info(&param.sf_buf_info_param,
+						      &buffer_info->sf_buf_info);
+			else
+				ion_mm_cp_sf_buf_info(&buffer_info->sf_buf_info,
+						      &param.sf_buf_info_param);
+		} else {
+			IONMSG(" sf_buf_info: not from %c heap.\n",
+			       buffer->heap->type);
+			ret = -EFAULT;
+		}
+		ion_drv_put_kernel_handle(kernel_handle);
 		break;
 	case ION_MM_ACQ_CACHE_POOL:
 	{

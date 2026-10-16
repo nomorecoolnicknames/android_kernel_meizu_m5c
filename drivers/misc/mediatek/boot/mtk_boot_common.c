@@ -33,7 +33,9 @@
 #include <linux/of_fdt.h>
 #endif
 #include <linux/atomic.h>
+#include <linux/string.h>
 #include <mt-plat/mtk_boot_common.h>
+#include <mt-plat/mtk_ccci_common.h>
 
 
 enum {
@@ -156,12 +158,25 @@ EXPORT_SYMBOL(is_advanced_meta_mode);
 
 static ssize_t boot_show(struct kobject *kobj, struct attribute *a, char *buf)
 {
+	/*
+	 * The "md" attribute is the legacy modem-boot trigger the stock m5c
+	 * ccci_mdinit expects at /sys/class/BOOT/BOOT/boot/md. The daemon only
+	 * writes it, but return the same status string as /sys/kernel/ccci/boot
+	 * so a read is meaningful too.
+	 */
+	if (a->name && !strcmp(a->name, "md"))
+		return ccci_get_boot_status(buf, PAGE_SIZE);
+
 	return sprintf(buf, "%d\n", get_boot_mode());
 }
 
 static ssize_t boot_store(struct kobject *kobj, struct attribute *a,
 	const char *buf, size_t count)
 {
+	/* "md": write the md_id character to start that modem (see boot_show) */
+	if (a->name && !strcmp(a->name, "md") && count > 0)
+		ccci_trigger_md_boot(buf[0] - '0');
+
 	return count;
 }
 
@@ -175,8 +190,16 @@ static const struct sysfs_ops boot_sysfs_ops = {
 /* boot attribute */
 struct attribute boot_attr = { BOOT_SYSFS_ATTR, 0644 };
 
+/*
+ * Legacy modem-boot trigger node expected by the stock m5c ccci_mdinit at
+ * /sys/class/BOOT/BOOT/boot/md. 0660 so the radio-uid daemon can write once
+ * init.modem.rc has chown'ed it (same as /sys/kernel/ccci/boot).
+ */
+struct attribute boot_md_attr = { "md", 0660 };
+
 static struct attribute *boot_attrs[] = {
 	&boot_attr,
+	&boot_md_attr,
 	NULL
 };
 

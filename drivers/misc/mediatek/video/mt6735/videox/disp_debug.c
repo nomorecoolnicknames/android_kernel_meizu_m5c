@@ -590,6 +590,495 @@ void ddp_process_dbg_opt(const char *opt)
 	int ret = 0;
 	char *p;
 
+	/* "forgedump" — the few registers that answer "is the
+	 * panel actually being scanned out", printed with pr_err so they
+	 * reach dmesg (the driver's own dump macros go to the display
+	 * logger, which is invisible here). */
+	/* ungate DISP_CCORR (bit15) and DISP_DITHER (bit18) by
+	 * hand. Both sit in the primary pixel path
+	 * (OVL0->COLOR0->CCORR->AAL->GAMMA->DITHER->RDMA0->PWM0->DSI0) and
+	 * read back as gated in MMSYS_CG_CON0 while the driver's shadow
+	 * register says they should be on — if the picture appears after
+	 * this write, that mismatch is why the panel stays black. */
+	if (0 == strncmp(opt, "forgeclk", 8)) {
+		pr_err("forge-disp: CG_CON0 before=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_MMSYS_CG_CON0));
+		DISP_CPU_REG_SET(DISP_REG_CONFIG_MMSYS_CG_CLR0,
+				 (1 << 15) | (1 << 18));
+		pr_err("forge-disp: CG_CON0 after=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_MMSYS_CG_CON0));
+		return;
+	}
+
+	/* paint the OVL's own background colour and turn every
+	 * layer off. The overlay then emits a solid colour with no buffer,
+	 * no M4U mapping and no composition involved, so whatever reaches
+	 * the panel tests exactly one thing: the path from OVL through
+	 * COLOR/CCORR/DITHER/RDMA/DSI to the glass. Red means that whole
+	 * path is healthy and the black screen is a content problem;
+	 * black means the fault is below the overlay. */
+	if (0 == strncmp(opt, "forgered", 8)) {
+		DISP_CPU_REG_SET(DISP_REG_OVL_ROI_BGCLR, 0xffff0000);
+		DISP_CPU_REG_SET(DISP_REG_OVL_SRC_CON, 0x0);
+		pr_err("forge-disp: BGCLR=0x%x SRC_CON=0x%x (solid red, layers off)\n",
+		       DISP_REG_GET(DISP_REG_OVL_ROI_BGCLR),
+		       DISP_REG_GET(DISP_REG_OVL_SRC_CON));
+		return;
+	}
+
+	/* force the crossbar into the wiring the primary path
+	 * actually needs. On a fresh boot DSI0_SEL reads 0, which selects
+	 * UFOE — and this chip has no UFOE at all (its reg entry in the
+	 * DISPSYS node is <0 0>), so the DSI is listening to nothing. The
+	 * same registers were observed in the other state later in the same
+	 * session, so something does reconnect the path eventually; this
+	 * puts it there on demand. */
+	/* reconnect the primary path through the path manager,
+	 * then show what the crossbar ended up as. */
+	/* force the session mode through the driver, with force=1.
+	 * The idle manager parks the path in decouple and the HAL then waits
+	 * for an overlay it can never get, so it never asks to come back.
+	 * This asks on its behalf: forgemode:1 = direct link, 2 = decouple. */
+	if (0 == strncmp(opt, "forgerel:", 9)) {
+		extern void forge_release_layer(unsigned int layer);
+		char *rp = (char *)opt + 9;
+		unsigned long int rl = 0;
+
+		if (kstrtoul(rp, 10, &rl))
+			pr_err("forge-disp: bad forgerel arg\n");
+		forge_release_layer((unsigned int)rl);
+		return;
+	}
+
+	if (0 == strncmp(opt, "forgemode:", 10)) {
+		char *fp = (char *)opt + 10;
+		unsigned long int fm = 0;
+
+		if (kstrtoul(fp, 10, &fm))
+			pr_err("forge-disp: bad forgemode arg\n");
+		pr_err("forge-disp: forcing session mode -> %lu\n", fm);
+		primary_display_switch_mode((int)fm,
+					    MAKE_DISP_SESSION(DISP_SESSION_PRIMARY, 0), 1);
+		pr_err("forge-disp: route now OVL0_MOUT=0x%x DITHER_MOUT=0x%x COLOR0_SEL=0x%x DSI0_SEL=0x%x RDMA0_SOUT=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_OVL0_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_DITHER_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_COLOR0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DSI0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_RDMA0_SOUT_SEL_IN));
+		return;
+	}
+
+	if (0 == strncmp(opt, "forgeconnect", 12)) {
+		extern void forge_reconnect_primary(void);
+
+		pr_err("forge-disp: route before OVL0_MOUT=0x%x DITHER_MOUT=0x%x COLOR0_SEL=0x%x DSI0_SEL=0x%x RDMA0_SOUT=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_OVL0_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_DITHER_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_COLOR0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DSI0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_RDMA0_SOUT_SEL_IN));
+		forge_reconnect_primary();
+		pr_err("forge-disp: route after  OVL0_MOUT=0x%x DITHER_MOUT=0x%x COLOR0_SEL=0x%x DSI0_SEL=0x%x RDMA0_SOUT=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_OVL0_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_DITHER_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_COLOR0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DSI0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_RDMA0_SOUT_SEL_IN));
+		return;
+	}
+
+	if (0 == strncmp(opt, "forgeroute", 10)) {
+		pr_err("forge-disp: route before OVL0_MOUT=0x%x DITHER_MOUT=0x%x COLOR0_SEL=0x%x DSI0_SEL=0x%x RDMA0_SOUT=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_OVL0_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_DITHER_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_COLOR0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DSI0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_RDMA0_SOUT_SEL_IN));
+		DISP_CPU_REG_SET(DISP_REG_CONFIG_DISP_OVL0_MOUT_EN, 0x1);
+		DISP_CPU_REG_SET(DISP_REG_CONFIG_DISP_DITHER_MOUT_EN, 0x1);
+		DISP_CPU_REG_SET(DISP_REG_CONFIG_DISP_COLOR0_SEL_IN, 0x1);
+		DISP_CPU_REG_SET(DISP_REG_CONFIG_DSI0_SEL_IN, 0x1);
+		DISP_CPU_REG_SET(DISP_REG_CONFIG_DISP_RDMA0_SOUT_SEL_IN, 0x2);
+		pr_err("forge-disp: route after  OVL0_MOUT=0x%x DITHER_MOUT=0x%x COLOR0_SEL=0x%x DSI0_SEL=0x%x RDMA0_SOUT=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_OVL0_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_DITHER_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_COLOR0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DSI0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_RDMA0_SOUT_SEL_IN));
+		return;
+	}
+
+	/* tear-probe: arm/disarm the self-sufficient CMDQ frame gate
+	 * (see forge_gate_arm in primary_display.c). "forgegate:0" restores
+	 * the stock wait-no-clear behaviour for an on-device A/B of the
+	 * stationary tear; "forgegate:1" re-arms the fix. Takes effect on
+	 * the next frame, no reflash needed. */
+	if (0 == strncmp(opt, "forgegate:", 10)) {
+		extern unsigned int forge_gate_arm;
+
+		forge_gate_arm = (opt[10] == '0') ? 0 : 1;
+		pr_err("forge-gate: arm=%u\n", forge_gate_arm);
+		return;
+	}
+
+	/*
+	 * tear-probe, the decisive one (2026-08-25): objective detector
+	 * of WHERE in the scan the visible layer addresses change, no eyes
+	 * needed.  Busy-samples OVL0 L0..L3 address registers paired with the
+	 * RDMA0 in/out line counters for ~2s (~120 frames) and records every
+	 * address change with the line position it happened at.
+	 *
+	 * Reading the result:
+	 *  - "smp" min/max/avg of the OUT line counter over uniform samples
+	 *    first proves whether the counter is a LIVE position (scattered,
+	 *    climbing) or a pinned value (then line numbers mean nothing);
+	 *  - if changes cluster at out_l ~0/height -> flips happen in
+	 *    blanking, the kernel latch path is clean and the tear must be
+	 *    content-level (producer writing a scanned buffer);
+	 *  - if changes sit mid-range (several hundred) -> mid-scan flips
+	 *    proven, with the exact distribution.
+	 */
+	/* forgewdma:SECONDS - run the WDMA shear probe (primary_display.c).
+	 * It tees the pixel stream the OVL actually emits toward the panel
+	 * into memory and runs the same row-signature shear analysis the
+	 * userspace probe runs on the SUBMITTED buffers, under the same
+	 * legitimacy rule (a zone needs two or more adjacent probe rows).
+	 * Comparing the two answers the open question directly: solid HARD
+	 * here means the stitch is real at the OVL output, clean captures
+	 * while the glass still tears exonerate everything from the OVL up
+	 * and leave DSI transmission and the panel.
+	 * Seconds are clamped to 1..30 by the probe itself.
+	 * Optional second field "forgewdma:SECONDS:N" lets N extra frames
+	 * pass between captures - lowers the probe's own readback load,
+	 * same statistics over a longer run (offsets between captures grow
+	 * by the same factor, keep N small during scroll). */
+	if (0 == strncmp(opt, "forgewdma:", 10)) {
+		unsigned int secs = 0, nth = 0;
+		extern int forge_wdma_shear_probe(unsigned int seconds,
+						  unsigned int nth);
+
+		if (sscanf(opt + 10, "%u:%u", &secs, &nth) < 1)
+			secs = 5;
+		pr_notice("forge-wdma: probe requested for %u s, nth=%u\n",
+			  secs, nth);
+		forge_wdma_shear_probe(secs, nth);
+		return;
+	}
+
+	/* forgeuflow:SECONDS - light mode of the probe above: only sample
+	 * and clear the sticky OVL0 INTSTA abnormal bits at ~250Hz, no
+	 * WDMA tee, no CPU readback.  Measures the underflow baseline
+	 * without the probe's own 3.6MB-per-frame memory load: run it over
+	 * a plain scroll AND over a static screen (idle detect is parked
+	 * for the run, so direct-link keeps scanning) and compare with
+	 * uflow_caps of the full probe under the same scroll.  Seconds
+	 * clamped to 1..60 by the probe. */
+	if (0 == strncmp(opt, "forgeuflow:", 11)) {
+		unsigned int secs = 0;
+		extern int forge_uflow_probe(unsigned int seconds);
+
+		if (kstrtouint(opt + 11, 0, &secs) != 0)
+			secs = 10;
+		pr_notice("forge-uflow: requested for %u s\n", secs);
+		forge_uflow_probe(secs);
+		return;
+	}
+
+	/* forgerel:N - hold input-layer release fences back by N extra
+	 * frames (0 = stock).  Decisive A/B for the premature-release
+	 * hypothesis behind the mid-render captures: with 1 the stitch
+	 * must vanish if the producer honours these fences (expect some
+	 * latency/fps cost), and must survive if the fence transport is
+	 * broken.  Applied from the next frame, live. */
+	if (0 == strncmp(opt, "forgerel:", 9)) {
+		extern unsigned int forge_rel_extra;
+		unsigned int v = 0;
+
+		if (kstrtouint(opt + 9, 0, &v) != 0 || v > 3) {
+			pr_notice("forge-rel: current=%u (usage forgerel:0..3)\n",
+				  forge_rel_extra);
+			return;
+		}
+		pr_notice("forge-rel: %u -> %u\n", forge_rel_extra, v);
+		forge_rel_extra = v;
+		return;
+	}
+
+	/* forgegmc:HEX - live A/B for the direct-link OVL layer-fetch ultra
+	 * thresholds (OVL_RDMAn_MEM_GMC_SETTING).  The new value is applied
+	 * by ovl_layer_config on the next frame, since every layer config
+	 * forces the register to this constant.  Stock is 6070; the driver
+	 * itself uses 50ff in decouple ("ultra almost always"), which is the
+	 * natural aggressive A/B point for the underflow lane.  Measure with
+	 * forgeuflow before and after. */
+	if (0 == strncmp(opt, "forgegmc:", 9)) {
+		extern unsigned int forge_ovl_gmc_dl;
+		unsigned int v = 0;
+
+		if (kstrtouint(opt + 9, 16, &v) != 0 || !v) {
+			pr_notice("forge-gmc: current=0x%x (usage forgegmc:HEX)\n",
+				  forge_ovl_gmc_dl);
+			return;
+		}
+		pr_notice("forge-gmc: 0x%x -> 0x%x\n", forge_ovl_gmc_dl, v);
+		forge_ovl_gmc_dl = v;
+		return;
+	}
+
+	/* forgereldone:0/1 - WHERE the layer release fences signal.
+	 * 1 (default): parked until the next RDMA0 frame-done, i.e. the
+	 * frame carrying the new config has fully left the pipe before
+	 * the displaced buffer is handed back to the producer.
+	 * 0: stock timing - inline in the cmdq callback right after the
+	 * config latch.  Live A/B, applies from the next frame; the
+	 * relwin counters in dmesg measure both modes. */
+	if (0 == strncmp(opt, "forgereldone:", 13)) {
+		extern unsigned int forge_rel_defer;
+		unsigned int v = 0;
+
+		if (kstrtouint(opt + 13, 0, &v) != 0 || v > 1) {
+			pr_notice("forge-reldef: current=%u (usage forgereldone:0/1)\n",
+				  forge_rel_defer);
+			return;
+		}
+		pr_notice("forge-reldef: %u -> %u\n", forge_rel_defer, v);
+		forge_rel_defer = v;
+		return;
+	}
+
+	if (0 == strncmp(opt, "forgetear", 9)) {
+		/* Line-position sources, deliberately redundant so the run
+		 * itself proves which one is live:
+		 *  - roi_y: OVL0 ADDCON_DBG bits 16..28 - the Y the OVL
+		 *    composer is emitting RIGHT NOW (authoritative field
+		 *    layout ddp_reg.h:2443-2448);
+		 *  - dbg7 bits 12..15: DSI VSA/VBP/VACT/VFP period flags -
+		 *    hardware "active scan vs blanking", no counter
+		 *    semantics involved (ddp_reg.h:885, offset 0x164);
+		 *  - out_l/in_l: the RDMA0 line counters the earlier slots
+		 *    used - kept for cross-calibration.
+		 * vact=1 on an address-change event = mid-scan flip, full
+		 * stop.  All events in blanking = kernel latch clean, the
+		 * tear is content-level. */
+		extern struct DSI_REGS *DSI_REG[2];
+		static unsigned int ev_l[96], ev_in[96], ev_out[96];
+		static unsigned int ev_old[96], ev_new[96];
+		static unsigned int ev_y[96], ev_d7[96];
+		unsigned int prev[4], cur, nev = 0, iters = 0;
+		unsigned int smp_min = 0xffffffff, smp_max = 0, i;
+		unsigned int vact_cnt = 0, y_min = 0xffffffff, y_max = 0;
+		unsigned long long smp_sum = 0;
+		unsigned long t_end = jiffies + HZ * 2;
+		const unsigned long addr_reg[4] = {
+			DISP_REG_OVL_L0_ADDR, DISP_REG_OVL_L1_ADDR,
+			DISP_REG_OVL_L2_ADDR, DISP_REG_OVL_L3_ADDR
+		};
+
+		if (!primary_display_is_alive()) {
+			pr_err("forge-tear: display is slept, refusing to sample\n");
+			return;
+		}
+
+		for (i = 0; i < 4; i++)
+			prev[i] = DISP_REG_GET(addr_reg[i]);
+
+		while (time_before(jiffies, t_end)) {
+			unsigned int out_l = DISP_REG_GET(DISP_REG_RDMA_OUT_LINE_CNT);
+			unsigned int in_l = DISP_REG_GET(DISP_REG_RDMA_IN_LINE_CNT);
+			unsigned int roi_y = (unsigned int)
+			    DISP_REG_GET_FIELD(ADDCON_DBG_FLD_ROI_Y,
+					       DISP_REG_OVL_ADDCON_DBG);
+			unsigned int dbg7 = DSI_REG[0] ?
+			    (INREG32(&DSI_REG[0]->DSI_STATE_DBG7) >> 12) & 0xf : 0;
+
+			iters++;
+			smp_sum += out_l;
+			if (out_l < smp_min)
+				smp_min = out_l;
+			if (out_l > smp_max)
+				smp_max = out_l;
+			if (roi_y < y_min)
+				y_min = roi_y;
+			if (roi_y > y_max)
+				y_max = roi_y;
+			if (dbg7 & 0x2)	/* bit13 = VACT_PERIOD */
+				vact_cnt++;
+
+			for (i = 0; i < 4; i++) {
+				cur = DISP_REG_GET(addr_reg[i]);
+				if (cur != prev[i]) {
+					if (nev < 96) {
+						ev_l[nev] = i;
+						ev_old[nev] = prev[i];
+						ev_new[nev] = cur;
+						ev_in[nev] = in_l;
+						ev_out[nev] = out_l;
+						ev_y[nev] = roi_y;
+						ev_d7[nev] = dbg7;
+						nev++;
+					}
+					prev[i] = cur;
+				}
+			}
+			if ((iters & 0x1fff) == 0)
+				cond_resched();
+		}
+
+		pr_err("forge-tear: iters=%u events=%u vact_share=%u/%u roi_y min/max=%u/%u out_l min/avg/max=%u/%llu/%u height=%d\n",
+		       iters, nev, vact_cnt, iters, y_min, y_max, smp_min,
+		       iters ? smp_sum / iters : 0, smp_max,
+		       primary_display_get_height());
+		for (i = 0; i < nev; i++)
+			pr_err("forge-tear: ev%02u L%u 0x%08x->0x%08x roi_y=%u vsa/vbp/vact/vfp=%u%u%u%u out_l=%u in_l=%u\n",
+			       i, ev_l[i], ev_old[i], ev_new[i], ev_y[i],
+			       (ev_d7[i] >> 3) & 1,	/* bit15 VSA */
+			       (ev_d7[i] >> 2) & 1,	/* bit14 VBP */
+			       (ev_d7[i] >> 1) & 1,	/* bit13 VACT */
+			       ev_d7[i] & 1,		/* bit12 VFP */
+			       ev_out[i], ev_in[i]);
+		return;
+	}
+
+	if (0 == strncmp(opt, "forgedump", 9)) {
+		extern void forge_report_mode(void);
+		extern unsigned int forge_irq_count[DISP_MODULE_NUM];
+		extern unsigned int forge_ioctl_nr_count[256];
+		int fi;
+		char fbuf[240];
+		int fn = 0;
+
+		forge_report_mode();	/* p67 */
+		/* which ioctls is the HAL actually making while it
+		 * waits? Only the numbers that were used are printed. */
+		for (fi = 0; fi < 256; fi++) {
+			if (!forge_ioctl_nr_count[fi])
+				continue;
+			if (fn > (int)sizeof(fbuf) - 24)
+				break;
+			fn += snprintf(fbuf + fn, sizeof(fbuf) - fn, "%d:%u ",
+				       fi, forge_ioctl_nr_count[fi]);
+		}
+		pr_err("forge-ioctl: %s\n", fbuf);
+		pr_err("forge-irq: RDMA0=%u DSI0=%u OVL0=%u MUTEX=%u\n",
+		       forge_irq_count[DISP_MODULE_RDMA0],
+		       forge_irq_count[DISP_MODULE_DSI0],
+		       forge_irq_count[DISP_MODULE_OVL0],
+		       forge_irq_count[DISP_MODULE_MUTEX]);
+		/* tear-probe: at which scanline does the CMDQ config
+		 * batch actually latch, and is the trigger loop (the only
+		 * consumer of DISP_RDMA0_EOF) alive. MUTEX=0 above is normal
+		 * on this build: _MTK_USER_ keeps gEnableIRQ=0, which gates
+		 * mutex0 INTEN off by design - it says nothing about the
+		 * mutex or its GCE events. */
+		{
+			extern void forge_dump_cmdq_gate(void);
+
+			forge_dump_cmdq_gate();
+		}
+		pr_err("forge-disp: MMSYS_CG_CON0=0x%x CG_CON1=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_MMSYS_CG_CON0),
+		       DISP_REG_GET(DISP_REG_CONFIG_MMSYS_CG_CON1));
+		pr_err("forge-disp: OVL0 STA=0x%x INTSTA=0x%x EN=0x%x ROI=0x%x L0_CON=0x%x L0_ADDR=0x%x\n",
+		       DISP_REG_GET(DISP_REG_OVL_STA),
+		       DISP_REG_GET(DISP_REG_OVL_INTSTA),
+		       DISP_REG_GET(DISP_REG_OVL_EN),
+		       DISP_REG_GET(DISP_REG_OVL_ROI_SIZE),
+		       DISP_REG_GET(DISP_REG_OVL_L0_CON),
+		       DISP_REG_GET(DISP_REG_OVL_L0_ADDR));
+		/* the registers that decide whether the configured
+		 * layer is actually FETCHED and whether the DDP path is wired
+		 * end to end. SRC_CON holds the per-layer enable bits; without
+		 * L0 set the OVL emits ROI_BGCLR (black) no matter how well
+		 * L0_CON/L0_ADDR are filled in. The MOUT/SEL_IN pairs are the
+		 * MMSYS crossbar; a port left at reset routes the pixel stream
+		 * nowhere. MUTEX0 MOD/SOF/EN decide whether any of it latches. */
+		pr_err("forge-disp: OVL0 SRC_CON=0x%x BGCLR=0x%x DATAPATH=0x%x L0_SRC_SIZE=0x%x L0_OFFSET=0x%x L0_PITCH=0x%x RDMA0_CTRL=0x%x\n",
+		       DISP_REG_GET(DISP_REG_OVL_SRC_CON),
+		       DISP_REG_GET(DISP_REG_OVL_ROI_BGCLR),
+		       DISP_REG_GET(DISP_REG_OVL_DATAPATH_CON),
+		       DISP_REG_GET(DISP_REG_OVL_L0_SRC_SIZE),
+		       DISP_REG_GET(DISP_REG_OVL_L0_OFFSET),
+		       DISP_REG_GET(DISP_REG_OVL_L0_PITCH),
+		       DISP_REG_GET(DISP_REG_OVL_RDMA0_CTRL));
+		pr_err("forge-disp: ROUTE OVL0_MOUT=0x%x DITHER_MOUT=0x%x UFOE_MOUT=0x%x COLOR0_SEL=0x%x UFOE_SEL=0x%x DSI0_SEL=0x%x RDMA0_SOUT=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_OVL0_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_DITHER_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_UFOE_MOUT_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_COLOR0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_UFOE_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DSI0_SEL_IN),
+		       DISP_REG_GET(DISP_REG_CONFIG_DISP_RDMA0_SOUT_SEL_IN));
+		pr_err("forge-disp: MUTEX0 MOD=0x%x SOF=0x%x EN=0x%x INTSTA=0x%x | RDMA0 GMC0=0x%x FIFO=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CONFIG_MUTEX0_MOD),
+		       DISP_REG_GET(DISP_REG_CONFIG_MUTEX0_SOF),
+		       DISP_REG_GET(DISP_REG_CONFIG_MUTEX0_EN),
+		       DISP_REG_GET(DISP_REG_CONFIG_MUTEX_INTSTA),
+		       DISP_REG_GET(DISP_REG_RDMA_MEM_GMC_SETTING_0),
+		       DISP_REG_GET(DISP_REG_RDMA_FIFO_CON));
+		{
+			/* DSI0 is the last stage: if it is not streaming, the
+			 * configured OVL/RDMA never reach the panel. Read it
+			 * straight from the driver's mapped registers. */
+			extern struct DSI_REGS *DSI_REG[2];
+
+			if (DSI_REG[0])
+				pr_err("forge-disp: DSI0 INTSTA=0x%x MODE_CTRL=0x%x TXRX_CTRL=0x%x PSCTRL=0x%x STA=0x%x START=0x%x\n",
+				       INREG32(&DSI_REG[0]->DSI_INTSTA),
+				       INREG32(&DSI_REG[0]->DSI_MODE_CTRL),
+				       INREG32(&DSI_REG[0]->DSI_TXRX_CTRL),
+				       INREG32(&DSI_REG[0]->DSI_PSCTRL),
+				       INREG32(&DSI_REG[0]->DSI_STA),
+				       INREG32(&DSI_REG[0]->DSI_START));
+			else
+				pr_err("forge-disp: DSI_REG[0] is NULL\n");
+			/* the PHY. Everything upstream can be perfect
+			 * and the panel still sees nothing if MIPITX is not
+			 * driving the lanes — the built-in DSI test pattern goes
+			 * through here too, which is why it also stayed black.
+			 * Also read back the BIST registers so "pattern on" is a
+			 * fact rather than an assumption. */
+			{
+				extern struct DSI_PHY_REGS *DSI_PHY_REG[2];
+
+				if (DSI_PHY_REG[0])
+					pr_err("forge-disp: MIPITX CON=0x%x CLK_LANE=0x%x D0=0x%x D1=0x%x D2=0x%x D3=0x%x TOP_CON=0x%x BG_CON=0x%x PLL0=0x%x PLL1=0x%x PLL2=0x%x\n",
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_CON),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_CLOCK_LANE),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_DATA_LANE0),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_DATA_LANE1),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_DATA_LANE2),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_DATA_LANE3),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_TOP_CON),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_BG_CON),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_PLL_CON0),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_PLL_CON1),
+					       INREG32(&DSI_PHY_REG[0]->MIPITX_DSI_PLL_CON2));
+				if (DSI_REG[0])
+					pr_err("forge-disp: DSI0 BIST_CON=0x%x BIST_PATTERN=0x%x VACT_NL=0x%x HSA=0x%x HBP=0x%x HFP=0x%x\n",
+					       INREG32(&DSI_REG[0]->DSI_BIST_CON),
+					       INREG32(&DSI_REG[0]->DSI_BIST_PATTERN),
+					       INREG32(&DSI_REG[0]->DSI_VACT_NL),
+					       INREG32(&DSI_REG[0]->DSI_HSA_WC),
+					       INREG32(&DSI_REG[0]->DSI_HBP_WC),
+					       INREG32(&DSI_REG[0]->DSI_HFP_WC));
+			}
+		}
+		pr_err("forge-disp: CCORR EN=0x%x CFG=0x%x SIZE=0x%x | DITHER EN=0x%x CFG=0x%x SIZE=0x%x\n",
+		       DISP_REG_GET(DISP_REG_CCORR_EN),
+		       DISP_REG_GET(DISP_REG_CCORR_CFG),
+		       DISP_REG_GET(DISP_REG_CCORR_SIZE),
+		       DISP_REG_GET(DISP_REG_DITHER_EN),
+		       DISP_REG_GET(DISP_REG_DITHER_CFG),
+		       DISP_REG_GET(DISP_REG_DITHER_SIZE));
+		pr_err("forge-disp: RDMA0 INTSTA=0x%x GLOBAL_CON=0x%x SIZE0=0x%x SIZE1=0x%x STATUS=0x%x\n",
+		       DISP_REG_GET(DISP_REG_RDMA_INT_STATUS),
+		       DISP_REG_GET(DISP_REG_RDMA_GLOBAL_CON),
+		       DISP_REG_GET(DISP_REG_RDMA_SIZE_CON_0),
+		       DISP_REG_GET(DISP_REG_RDMA_SIZE_CON_1),
+		       DISP_REG_GET(DISP_REG_RDMA_GLOBAL_CON));
+		return;
+	}
+
 	if (0 == strncmp(opt, "rdma_ultra:", 11)) {
 		p = (char *)opt + 11;
 		ret = kstrtoul(p, 16, &gRDMAUltraSetting);
@@ -1250,6 +1739,32 @@ static const struct file_operations layer_debug_fops = {
 	.release = layer_debug_release,
 };
 
+/* tear-probe: raw readout of the first HARD capture pair saved by
+ * forge_wdma_shear_probe (primary_display.c) - prev frame then cur
+ * frame, RGBA8888, geometry printed by the probe in dmesg (wdma:
+ * start line).  Empty until a probe run flags a HARD capture; content
+ * survives until the next probe run overwrites it or the box reboots.
+ * Do not read while a probe is running (single-operator tool). */
+static ssize_t forge_wdma_debug_read(struct file *file,
+				     char __user *ubuf, size_t count,
+				     loff_t *ppos)
+{
+	extern unsigned char *forge_wdma_hard_buf;
+	extern unsigned int forge_wdma_hard_bytes;
+
+	if (!forge_wdma_hard_buf || !forge_wdma_hard_bytes)
+		return 0;
+	return simple_read_from_buffer(ubuf, count, ppos,
+				       forge_wdma_hard_buf,
+				       forge_wdma_hard_bytes);
+}
+
+static const struct file_operations forge_wdma_debug_fops = {
+	.read = forge_wdma_debug_read,
+};
+
+static struct dentry *forge_wdma_dbgfs;
+
 void sub_debug_init(void)
 {
 	unsigned int i;
@@ -1278,6 +1793,11 @@ void sub_debug_init(void)
 							   (void *)&mtkfb_layer_dbg_opt[i],
 							   &layer_debug_fops);
 	}
+
+	forge_wdma_dbgfs = debugfs_create_file("forge_wdma",
+					       S_IFREG | S_IRUGO,
+					       disp_debugDir, NULL,
+					       &forge_wdma_debug_fops);
 }
 
 void sub_debug_deinit(void)
@@ -1286,6 +1806,7 @@ void sub_debug_deinit(void)
 
 	for (i = 0; i < DDP_OVL_LAYER_MUN; i++)
 		debugfs_remove(mtkfb_layer_dbgfs[i]);
+	debugfs_remove(forge_wdma_dbgfs);
 }
 
 unsigned int ddp_dump_reg_to_buf(unsigned int start_module, unsigned long *addr)

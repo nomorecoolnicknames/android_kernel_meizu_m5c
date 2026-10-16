@@ -400,16 +400,29 @@ int iReadRegI2C(u8 *a_pSendData , u16 a_sizeSendData, u8 *a_pRecvData, u16 a_siz
 		/*  */
 		i4RetValue = i2c_master_send(g_pstI2Cclient, a_pSendData, a_sizeSendData);
 		if (i4RetValue != a_sizeSendData) {
-			PK_ERR("[CAMERA SENSOR] I2C send failed!!, Addr = 0x%x\n", a_pSendData[0]);
+			/* m5c: name the wire, not just the register - the
+			 * front-sensor hunt needs to see WHICH adapter/slave NACKed */
+			pr_err("[iReadRegI2C] send fail bus1 i2c-%d slave=0x%02x reg=0x%02x%02x ret=%d\n",
+			       g_pstI2Cclient->adapter ? g_pstI2Cclient->adapter->nr : -1,
+			       g_pstI2Cclient->addr, a_pSendData[0],
+			       a_sizeSendData > 1 ? a_pSendData[1] : 0, i4RetValue);
 			return -1;
 		}
 
 		i4RetValue = i2c_master_recv(g_pstI2Cclient, (char *)a_pRecvData, a_sizeRecvData);
 		if (i4RetValue != a_sizeRecvData) {
-			PK_ERR("[CAMERA SENSOR] I2C read failed!!\n");
+			pr_err("[iReadRegI2C] recv fail bus1 i2c-%d slave=0x%02x ret=%d\n",
+			       g_pstI2Cclient->adapter ? g_pstI2Cclient->adapter->nr : -1,
+			       g_pstI2Cclient->addr, i4RetValue);
 			return -1;
 		}
 	} else {
+		/* m5c: the SUB socket rides this client; a missing
+		 * camera_sub@3c binding must fail loudly, not oops */
+		if (g_pstI2Cclient2 == NULL) {
+			pr_err_ratelimited("[iReadRegI2C] bus2 client NOT BOUND (camera_sub@3c missing?)\n");
+			return -1;
+		}
 		spin_lock(&kdsensor_drv_lock);
 		g_pstI2Cclient2->addr = (i2cId >> 1);
 
@@ -423,13 +436,18 @@ int iReadRegI2C(u8 *a_pSendData , u16 a_sizeSendData, u8 *a_pRecvData, u16 a_siz
 		spin_unlock(&kdsensor_drv_lock);
 		i4RetValue = i2c_master_send(g_pstI2Cclient2, a_pSendData, a_sizeSendData);
 		if (i4RetValue != a_sizeSendData) {
-			PK_ERR("[CAMERA SENSOR] I2C send failed!!, Addr = 0x%x\n", a_pSendData[0]);
+			pr_err("[iReadRegI2C] send fail bus2 i2c-%d slave=0x%02x reg=0x%02x%02x ret=%d\n",
+			       g_pstI2Cclient2->adapter ? g_pstI2Cclient2->adapter->nr : -1,
+			       g_pstI2Cclient2->addr, a_pSendData[0],
+			       a_sizeSendData > 1 ? a_pSendData[1] : 0, i4RetValue);
 			return -1;
 		}
 
 		i4RetValue = i2c_master_recv(g_pstI2Cclient2, (char *)a_pRecvData, a_sizeRecvData);
 		if (i4RetValue != a_sizeRecvData) {
-			PK_ERR("[CAMERA SENSOR] I2C read failed!!\n");
+			pr_err("[iReadRegI2C] recv fail bus2 i2c-%d slave=0x%02x ret=%d\n",
+			       g_pstI2Cclient2->adapter ? g_pstI2Cclient2->adapter->nr : -1,
+			       g_pstI2Cclient2->addr, i4RetValue);
 			return -1;
 		}
 	}
@@ -512,18 +530,33 @@ int kdSetI2CBusNum(u32 i2cBusNum)
 	return 0;
 }
 
+/*
+ * m5c: deliberately does NOT touch client->timing any more.
+ *
+ * mt_i2c programs the bus from client->timing on every transfer
+ * (mt_i2c_do_transfer -> i2c_set_speed) and the drivers here state their
+ * i2c_speed as 200/400 meaning kHz, so the raw value asks for 400 Hz and
+ * i2c_set_speed() fails: every transfer of that client then returns -EINVAL.
+ * But the obvious repairs are worse, and all three were tried on hardware:
+ *   - 400 as-is  -> front sensor unreadable, main camera survives only
+ *                   because it reads its id before it first calls in here
+ *   - kHz -> Hz  -> 400 kHz exceeds this board's i2c0 (def_speed = <0x64>
+ *                   in the stock DTB); BOTH cameras disappear
+ *   - clamp 100 kHz -> "Failed to set the speed" is gone, yet the transfer
+ *                   failures triple and the main camera is still lost
+ * The one configuration in which the main camera works is the one where this
+ * function never overrides the speed the device tree set up. So leave the bus
+ * alone and keep the caller's value only for the record.
+ */
 void kdSetI2CSpeed(u32 i2cSpeed)
 {
-	if (gI2CBusNum == SUPPORT_I2C_BUS_NUM1) {
-		spin_lock(&kdsensor_drv_lock);
-		g_pstI2Cclient->timing = i2cSpeed;
-		spin_unlock(&kdsensor_drv_lock);
-	} else {
-		spin_lock(&kdsensor_drv_lock);
-		g_pstI2Cclient2->timing = i2cSpeed;
-		spin_unlock(&kdsensor_drv_lock);
-	}
+	static u32 last_req;
 
+	if (i2cSpeed != last_req) {
+		last_req = i2cSpeed;
+		pr_info("[kd_sensorlist] sensor asked for %u kHz on bus%d - ignored, DT speed kept\n",
+			i2cSpeed, gI2CBusNum);
+	}
 }
 EXPORT_SYMBOL(kdSetI2CSpeed);
 
@@ -1138,6 +1171,12 @@ int kdSetDriver(unsigned int *pDrvIndex)
 
 	PK_XLOG_INFO("pDrvIndex:0x%08x/0x%08x\n", pDrvIndex[KDIMGSENSOR_INVOKE_DRIVER_0],
 		     pDrvIndex[KDIMGSENSOR_INVOKE_DRIVER_1]);
+	/* m5c: the HAL encodes (socket<<16)|drvIdx per invoke slot. The
+	 * bring-up question is whether it ever sends socket==2 (SUB): dump the
+	 * raw words so one capture answers it. PK_XLOG_INFO is compiled out. */
+	pr_info("[kd_sensorlist] SET_DRIVER raw[0]=0x%08x (socket=%u drvIdx=%u) raw[1]=0x%08x\n",
+		pDrvIndex[0], (pDrvIndex[0] & KDIMGSENSOR_DUAL_MASK_MSB) >> KDIMGSENSOR_DUAL_SHIFT,
+		pDrvIndex[0] & KDIMGSENSOR_DUAL_MASK_LSB, pDrvIndex[1]);
 	/* set driver for MAIN or SUB sensor */
 	/* Camera information */
 	gDrvIndex = pDrvIndex[KDIMGSENSOR_INVOKE_DRIVER_0];
@@ -1185,6 +1224,9 @@ int kdSetDriver(unsigned int *pDrvIndex)
 #endif
 		PK_XLOG_INFO("[kdSetDriver]g_invokeSocketIdx[%d] = %d\n", i, g_invokeSocketIdx[i]);
 		PK_XLOG_INFO("[kdSetDriver]drvIdx[%d] = %d\n", i, drvIdx[i]);
+		pr_info("[kd_sensorlist] SET_DRIVER slot%u: socket=%d drvIdx=%u bus=%u client2=%s\n",
+			i, g_invokeSocketIdx[i], drvIdx[i], gI2CBusNum,
+			g_pstI2Cclient2 ? "ok" : "NULL");
 		/*  */
 		if (MAX_NUM_OF_SUPPORT_SENSOR > drvIdx[i]) {
 			if (NULL == pSensorList[drvIdx[i]].SensorInit) {
@@ -1207,7 +1249,7 @@ int kdSetDriver(unsigned int *pDrvIndex)
 			       sizeof(pSensorList[drvIdx[i]].drvname));
 			/* return sensor ID */
 			/* pDrvIndex[0] = (unsigned int)pSensorList[drvIdx].SensorId; */
-			PK_XLOG_INFO("[kdSetDriver] :[%d][%d][%d][%s][%u]\n", i, g_bEnableDriver[i],
+			PK_XLOG_INFO("[kdSetDriver] :[%d][%d][%d][%s][%zu]\n", i, g_bEnableDriver[i],
 				     g_invokeSocketIdx[i], g_invokeSensorNameStr[i],
 				     sizeof(pSensorList[drvIdx[i]].drvname));
 		}
@@ -1226,6 +1268,8 @@ int kdSetCurrentSensorIdx(unsigned int idx)
 ********************************************************************************/
 int kdGetSocketPostion(unsigned int *pSocketPos)
 {
+	unsigned int in = *pSocketPos;
+
 	PK_XLOG_INFO("[%s][%d] \r\n", __func__, *pSocketPos);
 	switch (*pSocketPos) {
 	case DUAL_CAMERA_MAIN_SENSOR:
@@ -1241,6 +1285,7 @@ int kdGetSocketPostion(unsigned int *pSocketPos)
 		*pSocketPos = IMGSENSOR_SOCKET_POS_NONE;
 		break;
 	}
+	pr_info("[kd_sensorlist] GET_SOCKET_POS: in=%u out=0x%x\n", in, *pSocketPos);
 	return 0;
 }
 
@@ -1439,6 +1484,11 @@ static inline int adopt_CAMERA_HW_CheckIsAlive(void)
 	MUINT32 retLen = 0;
 
 	KD_IMGSENSOR_PROFILE_INIT();
+	/* m5c: show which socket(s) this alive-check powers - proves
+	 * from dmesg whether the HAL ever asks to check the SUB sensor. */
+	pr_info("[kd_sensorlist] CHECK_IS_ALIVE: slot0 socket=%d en=%d name=%s | slot1 socket=%d en=%d\n",
+		g_invokeSocketIdx[0], g_bEnableDriver[0], g_invokeSensorNameStr[0],
+		g_invokeSocketIdx[1], g_bEnableDriver[1]);
 	/* power on sensor */
 	kdModulePowerOn((enum CAMERA_DUAL_CAMERA_SENSOR_ENUM *) g_invokeSocketIdx, g_invokeSensorNameStr,
 			true, CAMERA_HW_DRVNAME1);
@@ -1551,6 +1601,307 @@ static inline int adopt_CAMERA_HW_GetResolution(void *pBuf)
 }   /* adopt_CAMERA_HW_GetResolution() */
 
 
+/* m5c: userspace ABI of the stock/Flyme camera blobs.
+ *
+ * This tree's ACDK_SENSOR_INFO_STRUCT is a later-BSP layout: 212 bytes, with
+ * 18 extra MUINT16 grab-start fields inserted right after SensorGrabStartY
+ * (offset 96) plus more fields further down. The 2016 blobs this ROM ships
+ * were built against the original mt6735 layout:
+ *   - GETINFO expects a 144-byte ACDK_SENSOR_INFO_STRUCT (stock kernel's
+ *     access_ok check is "+0x90", vmlinux @0xffffffc0005b8c34), and
+ *   - GETINFO2 expects the 192-byte ACDK_SENSOR_INFO2_STRUCT.
+ * The HAL keeps its two GETINFO output buffers INSIDE ImgSensorDrv, 144
+ * bytes each, immediately followed by the pInfo/pConfig pointer arrays
+ * (object offsets 0x228/0x2b8, pointers at 0x348 - constructor
+ * @0x11ba6 in libcam.halsensor.so). Copying sizeof(our struct)=212 bytes
+ * therefore (a) feeds every field past offset 96 from the wrong offset and
+ * (b) overruns the second buffer by 68 bytes, wiping those pointers with
+ * zeros; ImgSensorDrv::getCurrentSensorType then dereferences NULL+0x24 and
+ * mediaserver crash-loops before the sensor search can finish. That was the
+ * "camera dead on 4.9" root cause.
+ *
+ * So: never copy the kernel-side struct to userspace directly - marshal it
+ * into the exact legacy layout below (field list taken 1:1 from the 3.18
+ * m5c tree's kd_imgsensor_define.h, which this ROM's blobs match).
+ * ACDK_SENSOR_CONFIG_STRUCT / RESOLUTION / WINSIZE / VC structs are
+ * byte-identical between the trees and need no marshalling.
+ */
+struct ACDK_SENSOR_INFO_LEGACY_STRUCT {
+	MUINT16 SensorPreviewResolutionX;
+	MUINT16 SensorPreviewResolutionY;
+	MUINT16 SensorFullResolutionX;
+	MUINT16 SensorFullResolutionY;
+	MUINT8 SensorClockFreq;
+	MUINT8 SensorCameraPreviewFrameRate;
+	MUINT8 SensorVideoFrameRate;
+	MUINT8 SensorStillCaptureFrameRate;
+	MUINT8 SensorWebCamCaptureFrameRate;
+	MUINT8 SensorClockPolarity;
+	MUINT8 SensorClockFallingPolarity;
+	MUINT8 SensorClockRisingCount;
+	MUINT8 SensorClockFallingCount;
+	MUINT8 SensorClockDividCount;
+	MUINT8 SensorPixelClockCount;
+	MUINT8 SensorDataLatchCount;
+	MUINT8 SensorHsyncPolarity;
+	MUINT8 SensorVsyncPolarity;
+	MUINT8 SensorInterruptDelayLines;
+	MINT32 SensorResetActiveHigh;
+	MUINT32 SensorResetDelayCount;
+	enum ACDK_SENSOR_INTERFACE_TYPE_ENUM SensroInterfaceType;
+	enum ACDK_SENSOR_OUTPUT_DATA_FORMAT_ENUM SensorOutputDataFormat;
+	enum ACDK_SENSOR_MIPI_LANE_NUMBER_ENUM SensorMIPILaneNumber;
+	MUINT32 CaptureDelayFrame;
+	MUINT32 PreviewDelayFrame;
+	MUINT32 VideoDelayFrame;
+	MUINT32 HighSpeedVideoDelayFrame;
+	MUINT32 SlimVideoDelayFrame;
+	MUINT32 YUVAwbDelayFrame;
+	MUINT32 YUVEffectDelayFrame;
+	MUINT32 Custom1DelayFrame;
+	MUINT32 Custom2DelayFrame;
+	MUINT32 Custom3DelayFrame;
+	MUINT32 Custom4DelayFrame;
+	MUINT32 Custom5DelayFrame;
+	MUINT16 SensorGrabStartX;
+	MUINT16 SensorGrabStartY;
+	MUINT16 SensorDrivingCurrent;
+	MUINT8 SensorMasterClockSwitch;
+	MUINT8 AEShutDelayFrame;
+	MUINT8 AESensorGainDelayFrame;
+	MUINT8 AEISPGainDelayFrame;
+	MUINT8 MIPIDataLowPwr2HighSpeedTermDelayCount;
+	MUINT8 MIPIDataLowPwr2HighSpeedSettleDelayCount;
+	MUINT8 MIPICLKLowPwr2HighSpeedTermDelayCount;
+	MUINT8 SensorWidthSampling;
+	MUINT8 SensorHightSampling;
+	MUINT8 SensorPacketECCOrder;
+	enum SENSOR_MIPI_TYPE_ENUM MIPIsensorType;
+	MUINT8 SensorCaptureOutputJPEG;
+	MUINT8 SensorModeNum;
+	MUINT8 IHDR_Support;
+	MUINT16 IHDR_LE_FirstLine;
+	enum SENSOR_SETTLEDELAY_MODE_ENUM SettleDelayMode;
+	MUINT8 PDAF_Support;
+	MUINT8 DPCM_INFO;
+	MUINT8 PerFrameCTL_Support;
+	enum SENSOR_SCAM_DATA_CHANNEL_ENUM SCAM_DataNumber;
+	MUINT8 SCAM_DDR_En;
+	MUINT8 SCAM_CLK_INV;
+	MUINT8 SCAM_DEFAULT_DELAY;
+	MUINT8 SCAM_CRC_En;
+	MUINT8 SCAM_SOF_src;
+	MUINT32 SCAM_Timout_Cali;
+};
+
+struct ACDK_SENSOR_INFO2_LEGACY_STRUCT {
+	MUINT16 SensorPreviewResolutionX;
+	MUINT16 SensorPreviewResolutionY;
+	MUINT16 SensorFullResolutionX;
+	MUINT16 SensorFullResolutionY;
+	MUINT8 SensorClockFreq;
+	MUINT8 SensorCameraPreviewFrameRate;
+	MUINT8 SensorVideoFrameRate;
+	MUINT8 SensorStillCaptureFrameRate;
+	MUINT8 SensorWebCamCaptureFrameRate;
+	MUINT8 SensorClockPolarity;
+	MUINT8 SensorClockFallingPolarity;
+	MUINT8 SensorClockRisingCount;
+	MUINT8 SensorClockFallingCount;
+	MUINT8 SensorClockDividCount;
+	MUINT8 SensorPixelClockCount;
+	MUINT8 SensorDataLatchCount;
+	MUINT8 SensorHsyncPolarity;
+	MUINT8 SensorVsyncPolarity;
+	MUINT8 SensorInterruptDelayLines;
+	MINT32 SensorResetActiveHigh;
+	MUINT32 SensorResetDelayCount;
+	enum ACDK_SENSOR_INTERFACE_TYPE_ENUM SensroInterfaceType;
+	enum ACDK_SENSOR_OUTPUT_DATA_FORMAT_ENUM SensorOutputDataFormat;
+	enum ACDK_SENSOR_MIPI_LANE_NUMBER_ENUM SensorMIPILaneNumber;
+	MUINT32 CaptureDelayFrame;
+	MUINT32 PreviewDelayFrame;
+	MUINT32 VideoDelayFrame;
+	MUINT32 HighSpeedVideoDelayFrame;
+	MUINT32 SlimVideoDelayFrame;
+	MUINT32 YUVAwbDelayFrame;
+	MUINT32 YUVEffectDelayFrame;
+	MUINT32 Custom1DelayFrame;
+	MUINT32 Custom2DelayFrame;
+	MUINT32 Custom3DelayFrame;
+	MUINT32 Custom4DelayFrame;
+	MUINT32 Custom5DelayFrame;
+	MUINT16 SensorGrabStartX_PRV;
+	MUINT16 SensorGrabStartY_PRV;
+	MUINT16 SensorGrabStartX_CAP;
+	MUINT16 SensorGrabStartY_CAP;
+	MUINT16 SensorGrabStartX_VD;
+	MUINT16 SensorGrabStartY_VD;
+	MUINT16 SensorGrabStartX_VD1;
+	MUINT16 SensorGrabStartY_VD1;
+	MUINT16 SensorGrabStartX_VD2;
+	MUINT16 SensorGrabStartY_VD2;
+	MUINT16 SensorGrabStartX_CST1;
+	MUINT16 SensorGrabStartY_CST1;
+	MUINT16 SensorGrabStartX_CST2;
+	MUINT16 SensorGrabStartY_CST2;
+	MUINT16 SensorGrabStartX_CST3;
+	MUINT16 SensorGrabStartY_CST3;
+	MUINT16 SensorGrabStartX_CST4;
+	MUINT16 SensorGrabStartY_CST4;
+	MUINT16 SensorGrabStartX_CST5;
+	MUINT16 SensorGrabStartY_CST5;
+	MUINT16 SensorDrivingCurrent;
+	MUINT8 SensorMasterClockSwitch;
+	MUINT8 AEShutDelayFrame;
+	MUINT8 AESensorGainDelayFrame;
+	MUINT8 AEISPGainDelayFrame;
+	MUINT8 MIPIDataLowPwr2HighSpeedTermDelayCount;
+	MUINT8 MIPIDataLowPwr2HighSpeedSettleDelayCount;
+	MUINT8 MIPIDataLowPwr2HSSettleDelayM0;
+	MUINT8 MIPIDataLowPwr2HSSettleDelayM1;
+	MUINT8 MIPIDataLowPwr2HSSettleDelayM2;
+	MUINT8 MIPIDataLowPwr2HSSettleDelayM3;
+	MUINT8 MIPIDataLowPwr2HSSettleDelayM4;
+	MUINT8 MIPICLKLowPwr2HighSpeedTermDelayCount;
+	MUINT8 SensorWidthSampling;
+	MUINT8 SensorHightSampling;
+	MUINT8 SensorPacketECCOrder;
+	enum SENSOR_MIPI_TYPE_ENUM MIPIsensorType;
+	MUINT8 SensorCaptureOutputJPEG;
+	MUINT8 SensorModeNum;
+	MUINT8 IHDR_Support;
+	MUINT16 IHDR_LE_FirstLine;
+	enum SENSOR_SETTLEDELAY_MODE_ENUM SettleDelayMode;
+	MUINT8 PDAF_Support;
+	MUINT8 DPCM_INFO;
+	MUINT8 IMGSENSOR_DPCM_TYPE_PRE;
+	MUINT8 IMGSENSOR_DPCM_TYPE_CAP;
+	MUINT8 IMGSENSOR_DPCM_TYPE_VD;
+	MUINT8 IMGSENSOR_DPCM_TYPE_VD1;
+	MUINT8 IMGSENSOR_DPCM_TYPE_VD2;
+	MUINT8 PerFrameCTL_Support;
+	enum SENSOR_SCAM_DATA_CHANNEL_ENUM SCAM_DataNumber;
+	MUINT8 SCAM_DDR_En;
+	MUINT8 SCAM_CLK_INV;
+	MUINT8 SCAM_DEFAULT_DELAY;
+	MUINT8 SCAM_CRC_En;
+	MUINT8 SCAM_SOF_src;
+	MUINT32 SCAM_Timout_Cali;
+};
+
+#define KD_LEGACY_COPY_COMMON(d, s) do { \
+	(d)->SensorPreviewResolutionX = (s)->SensorPreviewResolutionX; \
+	(d)->SensorPreviewResolutionY = (s)->SensorPreviewResolutionY; \
+	(d)->SensorFullResolutionX = (s)->SensorFullResolutionX; \
+	(d)->SensorFullResolutionY = (s)->SensorFullResolutionY; \
+	(d)->SensorClockFreq = (s)->SensorClockFreq; \
+	(d)->SensorCameraPreviewFrameRate = (s)->SensorCameraPreviewFrameRate; \
+	(d)->SensorVideoFrameRate = (s)->SensorVideoFrameRate; \
+	(d)->SensorStillCaptureFrameRate = (s)->SensorStillCaptureFrameRate; \
+	(d)->SensorWebCamCaptureFrameRate = (s)->SensorWebCamCaptureFrameRate; \
+	(d)->SensorClockPolarity = (s)->SensorClockPolarity; \
+	(d)->SensorClockFallingPolarity = (s)->SensorClockFallingPolarity; \
+	(d)->SensorClockRisingCount = (s)->SensorClockRisingCount; \
+	(d)->SensorClockFallingCount = (s)->SensorClockFallingCount; \
+	(d)->SensorClockDividCount = (s)->SensorClockDividCount; \
+	(d)->SensorPixelClockCount = (s)->SensorPixelClockCount; \
+	(d)->SensorDataLatchCount = (s)->SensorDataLatchCount; \
+	(d)->SensorHsyncPolarity = (s)->SensorHsyncPolarity; \
+	(d)->SensorVsyncPolarity = (s)->SensorVsyncPolarity; \
+	(d)->SensorInterruptDelayLines = (s)->SensorInterruptDelayLines; \
+	(d)->SensorResetActiveHigh = (s)->SensorResetActiveHigh; \
+	(d)->SensorResetDelayCount = (s)->SensorResetDelayCount; \
+	(d)->SensroInterfaceType = (s)->SensroInterfaceType; \
+	(d)->SensorOutputDataFormat = (s)->SensorOutputDataFormat; \
+	(d)->SensorMIPILaneNumber = (s)->SensorMIPILaneNumber; \
+	(d)->CaptureDelayFrame = (s)->CaptureDelayFrame; \
+	(d)->PreviewDelayFrame = (s)->PreviewDelayFrame; \
+	(d)->VideoDelayFrame = (s)->VideoDelayFrame; \
+	(d)->HighSpeedVideoDelayFrame = (s)->HighSpeedVideoDelayFrame; \
+	(d)->SlimVideoDelayFrame = (s)->SlimVideoDelayFrame; \
+	(d)->YUVAwbDelayFrame = (s)->YUVAwbDelayFrame; \
+	(d)->YUVEffectDelayFrame = (s)->YUVEffectDelayFrame; \
+	(d)->Custom1DelayFrame = (s)->Custom1DelayFrame; \
+	(d)->Custom2DelayFrame = (s)->Custom2DelayFrame; \
+	(d)->Custom3DelayFrame = (s)->Custom3DelayFrame; \
+	(d)->Custom4DelayFrame = (s)->Custom4DelayFrame; \
+	(d)->Custom5DelayFrame = (s)->Custom5DelayFrame; \
+	(d)->SensorDrivingCurrent = (s)->SensorDrivingCurrent; \
+	(d)->SensorMasterClockSwitch = (s)->SensorMasterClockSwitch; \
+	(d)->AEShutDelayFrame = (s)->AEShutDelayFrame; \
+	(d)->AESensorGainDelayFrame = (s)->AESensorGainDelayFrame; \
+	(d)->AEISPGainDelayFrame = (s)->AEISPGainDelayFrame; \
+	(d)->MIPIDataLowPwr2HighSpeedTermDelayCount = (s)->MIPIDataLowPwr2HighSpeedTermDelayCount; \
+	(d)->MIPIDataLowPwr2HighSpeedSettleDelayCount = (s)->MIPIDataLowPwr2HighSpeedSettleDelayCount; \
+	(d)->MIPICLKLowPwr2HighSpeedTermDelayCount = (s)->MIPICLKLowPwr2HighSpeedTermDelayCount; \
+	(d)->SensorWidthSampling = (s)->SensorWidthSampling; \
+	(d)->SensorHightSampling = (s)->SensorHightSampling; \
+	(d)->SensorPacketECCOrder = (s)->SensorPacketECCOrder; \
+	(d)->MIPIsensorType = (s)->MIPIsensorType; \
+	(d)->SensorCaptureOutputJPEG = (s)->SensorCaptureOutputJPEG; \
+	(d)->SensorModeNum = (s)->SensorModeNum; \
+	(d)->IHDR_Support = (s)->IHDR_Support; \
+	(d)->IHDR_LE_FirstLine = (s)->IHDR_LE_FirstLine; \
+	(d)->SettleDelayMode = (s)->SettleDelayMode; \
+	(d)->PDAF_Support = (s)->PDAF_Support; \
+	(d)->DPCM_INFO = (s)->DPCM_INFO; \
+	(d)->PerFrameCTL_Support = (s)->PerFrameCTL_Support; \
+	(d)->SCAM_DataNumber = (s)->SCAM_DataNumber; \
+	(d)->SCAM_DDR_En = (s)->SCAM_DDR_En; \
+	(d)->SCAM_CLK_INV = (s)->SCAM_CLK_INV; \
+	(d)->SCAM_DEFAULT_DELAY = (s)->SCAM_DEFAULT_DELAY; \
+	(d)->SCAM_CRC_En = (s)->SCAM_CRC_En; \
+	(d)->SCAM_SOF_src = (s)->SCAM_SOF_src; \
+	(d)->SCAM_Timout_Cali = (s)->SCAM_Timout_Cali; \
+} while (0)
+
+static void kd_info_to_legacy(const MSDK_SENSOR_INFO_STRUCT *s,
+			      struct ACDK_SENSOR_INFO_LEGACY_STRUCT *d)
+{
+	memset(d, 0, sizeof(*d));
+	KD_LEGACY_COPY_COMMON(d, s);
+	d->SensorGrabStartX = s->SensorGrabStartX;
+	d->SensorGrabStartY = s->SensorGrabStartY;
+}
+
+static void kd_info2_to_legacy(const MSDK_SENSOR_INFO_STRUCT *s,
+			       struct ACDK_SENSOR_INFO2_LEGACY_STRUCT *d)
+{
+	memset(d, 0, sizeof(*d));
+	KD_LEGACY_COPY_COMMON(d, s);
+	d->SensorGrabStartX_PRV = s->SensorGrabStartX_PRV;
+	d->SensorGrabStartY_PRV = s->SensorGrabStartY_PRV;
+	d->SensorGrabStartX_CAP = s->SensorGrabStartX_CAP;
+	d->SensorGrabStartY_CAP = s->SensorGrabStartY_CAP;
+	d->SensorGrabStartX_VD = s->SensorGrabStartX_VD;
+	d->SensorGrabStartY_VD = s->SensorGrabStartY_VD;
+	d->SensorGrabStartX_VD1 = s->SensorGrabStartX_VD1;
+	d->SensorGrabStartY_VD1 = s->SensorGrabStartY_VD1;
+	d->SensorGrabStartX_VD2 = s->SensorGrabStartX_VD2;
+	d->SensorGrabStartY_VD2 = s->SensorGrabStartY_VD2;
+	d->SensorGrabStartX_CST1 = s->SensorGrabStartX_CST1;
+	d->SensorGrabStartY_CST1 = s->SensorGrabStartY_CST1;
+	d->SensorGrabStartX_CST2 = s->SensorGrabStartX_CST2;
+	d->SensorGrabStartY_CST2 = s->SensorGrabStartY_CST2;
+	d->SensorGrabStartX_CST3 = s->SensorGrabStartX_CST3;
+	d->SensorGrabStartY_CST3 = s->SensorGrabStartY_CST3;
+	d->SensorGrabStartX_CST4 = s->SensorGrabStartX_CST4;
+	d->SensorGrabStartY_CST4 = s->SensorGrabStartY_CST4;
+	d->SensorGrabStartX_CST5 = s->SensorGrabStartX_CST5;
+	d->SensorGrabStartY_CST5 = s->SensorGrabStartY_CST5;
+	d->MIPIDataLowPwr2HSSettleDelayM0 = s->MIPIDataLowPwr2HSSettleDelayM0;
+	d->MIPIDataLowPwr2HSSettleDelayM1 = s->MIPIDataLowPwr2HSSettleDelayM1;
+	d->MIPIDataLowPwr2HSSettleDelayM2 = s->MIPIDataLowPwr2HSSettleDelayM2;
+	d->MIPIDataLowPwr2HSSettleDelayM3 = s->MIPIDataLowPwr2HSSettleDelayM3;
+	d->MIPIDataLowPwr2HSSettleDelayM4 = s->MIPIDataLowPwr2HSSettleDelayM4;
+	d->IMGSENSOR_DPCM_TYPE_PRE = s->IMGSENSOR_DPCM_TYPE_PRE;
+	d->IMGSENSOR_DPCM_TYPE_CAP = s->IMGSENSOR_DPCM_TYPE_CAP;
+	d->IMGSENSOR_DPCM_TYPE_VD = s->IMGSENSOR_DPCM_TYPE_VD;
+	d->IMGSENSOR_DPCM_TYPE_VD1 = s->IMGSENSOR_DPCM_TYPE_VD1;
+	d->IMGSENSOR_DPCM_TYPE_VD2 = s->IMGSENSOR_DPCM_TYPE_VD2;
+}
+
 /*******************************************************************************
 * adopt_CAMERA_HW_GetInfo
 ********************************************************************************/
@@ -1588,11 +1939,20 @@ static inline int adopt_CAMERA_HW_GetInfo(void *pBuf)
 
 
 
+	/* m5c: the blob's buffers hold the 144-byte legacy layout; a
+	 * sizeof(our struct)=212 copy both shifts every field past offset 96
+	 * and overruns the HAL's pInfo pointer array (SIGSEGV in
+	 * getCurrentSensorType). BUILD_BUG_ON pins the ABI.
+	 */
+	BUILD_BUG_ON(sizeof(struct ACDK_SENSOR_INFO_LEGACY_STRUCT) != 144);
 	for (i = 0; i < 2; i++) {
+		struct ACDK_SENSOR_INFO_LEGACY_STRUCT legacy_info;
+
+		kd_info_to_legacy(pInfo[i], &legacy_info);
 		/* SenorInfo */
 		if (copy_to_user
-		    ((void __user *)(pSensorGetInfo->pInfo[i]), (void *)pInfo[i],
-		     sizeof(MSDK_SENSOR_INFO_STRUCT))) {
+		    ((void __user *)(pSensorGetInfo->pInfo[i]), (void *)&legacy_info,
+		     sizeof(legacy_info))) {
 			PK_DBG("[CAMERA_HW][info] ioctl copy to user failed\n");
 			return -EFAULT;
 		}
@@ -1807,11 +2167,21 @@ inline static int adopt_CAMERA_HW_GetInfo2(void *pBuf)
 	SensorInfo.SensorGrabStartX_CST5 = pInfo4[IDNum]->SensorGrabStartX;
 	SensorInfo.SensorGrabStartY_CST5 = pInfo4[IDNum]->SensorGrabStartY;
 
-	if (copy_to_user
-	    ((void __user *)(pSensorGetInfo->pInfo), (void *)(&SensorInfo),
-	     sizeof(ACDK_SENSOR_INFO2_STRUCT))) {
-		PK_DBG("[CAMERA_HW][info] ioctl copy to user failed\n");
-		return -EFAULT;
+	/* m5c: GETINFO2 userspace ABI is the 192-byte legacy
+	 * ACDK_SENSOR_INFO2_STRUCT, not our 212-byte struct (see the legacy
+	 * marshalling block above adopt_CAMERA_HW_GetInfo).
+	 */
+	BUILD_BUG_ON(sizeof(struct ACDK_SENSOR_INFO2_LEGACY_STRUCT) != 192);
+	{
+		struct ACDK_SENSOR_INFO2_LEGACY_STRUCT legacy_info2;
+
+		kd_info2_to_legacy(&SensorInfo, &legacy_info2);
+		if (copy_to_user
+		    ((void __user *)(pSensorGetInfo->pInfo), (void *)(&legacy_info2),
+		     sizeof(legacy_info2))) {
+			PK_DBG("[CAMERA_HW][info] ioctl copy to user failed\n");
+			return -EFAULT;
+		}
 	}
 
 	/* Step2 : Get Resolution */
@@ -2748,7 +3118,15 @@ inline static int kdSetSensorMclk(int *pBuf)
 		pSensorCtrl->freq);
 	if (1 == pSensorCtrl->on) {
 		enable_mux(MT_MUX_CAMTG, "CAMERA_SENSOR");
-		clkmux_sel(MT_MUX_CAMTG, pSensorCtrl->freq, "CAMERA_SENSOR");
+		/* m5c: freq is a CLK_CFG_1[26:24] source index straight
+		 * the HAL blob; clkmux_sel() BUG_ONs out-of-range values (CAMTG has
+		 * nr_inputs = 7), so refuse garbage instead of panicking.
+		 */
+		if (pSensorCtrl->freq < 7)
+			clkmux_sel(MT_MUX_CAMTG, pSensorCtrl->freq, "CAMERA_SENSOR");
+		else
+			pr_err("[CAMERA SENSOR] kdSetSensorMclk: bad CAMTG clksrc %d\n",
+			       pSensorCtrl->freq);
 	} else {
 
 		disable_mux(MT_MUX_CAMTG, "CAMERA_SENSOR");
@@ -2873,7 +3251,7 @@ bool Get_Cam_Regulator(void)
 				sensor_device->of_node =
 				    of_find_compatible_node(NULL, NULL,
 							    "mediatek,camera_hw");
-				/* 若你需要sub也定義的話，需要自己加上
+				/* 嚙磐嚙璀嚙豎要sub嚙稽嚙緩嚙緬嚙踝蕭嚙豌，嚙豎要嚙諛己嚙稼嚙磕
 				   if (regVCAMA == NULL) {
 				   regVCAMA_SUB = regulator_get(sensor_device, "SUB_CAMERA_POWER_A");
 				   }
@@ -2906,11 +3284,73 @@ bool Get_Cam_Regulator(void)
 			return FALSE;
 		}
 
+		/* m5c: the front S5K5E8 digital core is powered from the
+		 * PMIC LDO VGP1, not from vcamd - proven by the stock Flyme kernel:
+		 * its Get_Cam_Regulator (vmlinux @ 0xffffffc0005ba974) does
+		 * regulator_get("vgp1") into the slot that its _hwPowerOn type 4
+		 * consumes, and the s5k5e8 power-on branch enables exactly that slot
+		 * at 1.2V. The DTB's vcamd_sub-supply points at the vcamd LDO and is
+		 * therefore wrong for this module - do not use it. No camera node
+		 * carries a vgp1-supply, so resolve the LDO by its regulator name:
+		 * regulator_dev_lookup() in this tree falls back to
+		 * regulator_lookup_by_name() (drivers/regulator/core.c) when the
+		 * consumer device has no of_node mapping, which is exactly how the
+		 * four vcam* gets above already resolve (sensor_device is a class
+		 * device without an of_node). If "vgp1" is not registered this
+		 * yields a dummy/error regulator; _hwPowerOn(SUB_VCAMD) then fails
+		 * loudly and the front camera stays off without touching anything
+		 * else.
+		 */
+		if (regSubVCAMD == NULL) {
+			regSubVCAMD = regulator_get(sensor_device, "vgp1");
+			if (IS_ERR(regSubVCAMD))
+				pr_err("[kd_sensorlist] SUB_VCAMD regulator_get(vgp1) failed: %ld\n",
+				       PTR_ERR(regSubVCAMD));
+		}
+
+		/* m5c: the power-on prints in this path are PK_DBG/pr_debug
+		 * and invisible on the device; report once what actually resolved so
+		 * the next capture answers it without guessing.
+		 */
+		pr_info("[kd_sensorlist] Get_Cam_Regulator: vcama=%d vcamd=%d vcamio=%d vcamaf=%d vgp1(sub)=%d (1=ok)\n",
+			!(regVCAMA == NULL || IS_ERR(regVCAMA)),
+			!(regVCAMD == NULL || IS_ERR(regVCAMD)),
+			!(regVCAMIO == NULL || IS_ERR(regVCAMIO)),
+			!(regVCAMAF == NULL || IS_ERR(regVCAMAF)),
+			!(regSubVCAMD == NULL || IS_ERR(regSubVCAMD)));
+
 		return TRUE;
 	}
 	return FALSE;
 }
 
+
+/*
+ * m5c: what the camera rails really are at a given point - the
+ * voltage the PMIC is set to and whether the LDO is on, as the regulator
+ * core sees them. For the front S5K5E8 probe, which answers I2C_ACKERR on
+ * stock-identical power: vgp1 (its core) is shared with the gt9xx touch
+ * ("vtouch"), so its real level at probe time is the open question.
+ */
+static void forge_cam_rail(const char *tag, const char *name, struct regulator *reg)
+{
+	if (reg == NULL || IS_ERR(reg)) {
+		pr_info("[forge_cam_rail] %s %s: none\n", tag, name);
+		return;
+	}
+	pr_info("[forge_cam_rail] %s %s: %duV %s\n", tag, name, regulator_get_voltage(reg),
+		regulator_is_enabled(reg) ? "on" : "off");
+}
+
+void forge_cam_rail_report(const char *tag)
+{
+	forge_cam_rail(tag, "vcama", regVCAMA);
+	forge_cam_rail(tag, "vcamd", regVCAMD);
+	forge_cam_rail(tag, "vcamio", regVCAMIO);
+	forge_cam_rail(tag, "vcamaf", regVCAMAF);
+	forge_cam_rail(tag, "vgp1(sub_vcamd)", regSubVCAMD);
+}
+EXPORT_SYMBOL(forge_cam_rail_report);
 
 bool _hwPowerOn(KD_REGULATOR_TYPE_T type, int powerVolt)
 {
@@ -2925,24 +3365,41 @@ bool _hwPowerOn(KD_REGULATOR_TYPE_T type, int powerVolt)
 		reg = regVCAMIO;
 	} else if (type == VCAMAF) {
 		reg = regVCAMAF;
+	} else if (type == SUB_VCAMD) {
+		/* m5c: vgp1, see Get_Cam_Regulator */
+		reg = regSubVCAMD;
 	} else
 		return ret;
 
 	if (reg != NULL && !IS_ERR(reg)) {
 		if (regulator_set_voltage(reg, powerVolt, powerVolt) != 0) {
-			PK_DBG
+			/* m5c: loud on purpose - a 1.2V SUB_VCAMD request
+			 * failing here most likely means another consumer (the
+			 * GT9XXTB touch driver claims this same vgp1 LDO as "vtouch"
+			 * at 2.8V) holds a conflicting voltage range, and the front
+			 * sensor core is then mis-powered. PK_DBG is pr_debug and
+			 * invisible on the device.
+			 */
+			pr_err
 			    ("[_hwPowerOn]fail to regulator_set_voltage, powertype:%d powerId:%d\n",
 			     type, powerVolt);
 			return ret;
 		}
 		if (regulator_enable(reg) != 0) {
-			PK_DBG("[_hwPowerOn]fail to regulator_enable, powertype:%d powerId:%d\n",
+			pr_err("[_hwPowerOn]fail to regulator_enable, powertype:%d powerId:%d\n",
 			       type, powerVolt);
 			return ret;
 		}
+		/* m5c: visible trace of every camera rail change - the
+		 * PK_DBG prints here are compiled to pr_debug and the previous
+		 * bring-up round burned a device cycle on guessing whether this
+		 * path runs at all.
+		 */
+		pr_info("[_hwPowerOn] type=%d %duV ok (now %s)\n", type, powerVolt,
+			regulator_is_enabled(reg) ? "on" : "OFF?!");
 		ret = true;
 	} else {
-		PK_DBG("[_hwPowerOn]IS_ERR_OR_NULL powertype:%d\n", type);
+		pr_err("[_hwPowerOn]IS_ERR_OR_NULL powertype:%d\n", type);
 		return ret;
 	}
 
@@ -2963,20 +3420,24 @@ bool _hwPowerDown(KD_REGULATOR_TYPE_T type)
 		reg = regVCAMIO;
 	} else if (type == VCAMAF) {
 		reg = regVCAMAF;
+	} else if (type == SUB_VCAMD) {
+		/* m5c: vgp1, see Get_Cam_Regulator */
+		reg = regSubVCAMD;
 	} else
 		return ret;
 
-	if (!IS_ERR(reg)) {
+	if (reg != NULL && !IS_ERR(reg)) {
 		if (regulator_is_enabled(reg) != 0) {
 			PK_DBG("[_hwPowerDown]%d is enabled\n", type);
 		}
 		if (regulator_disable(reg) != 0) {
-			PK_DBG("[_hwPowerDown]fail to regulator_disable, powertype: %d\n\n", type);
+			pr_err("[_hwPowerDown]fail to regulator_disable, powertype: %d\n\n", type);
 			return ret;
 		}
+		pr_info("[_hwPowerDown] type=%d ok\n", type);
 		ret = true;
 	} else {
-		PK_DBG("[_hwPowerDown]%d fail to power down  due to regVCAM == NULL\n", type);
+		pr_err("[_hwPowerDown]%d fail to power down  due to regVCAM == NULL\n", type);
 		return ret;
 	}
 	return ret;
@@ -3001,9 +3462,13 @@ static int compat_get_acdk_sensor_getinfo_struct(struct COMPAT_ACDK_SENSOR_GETIN
 	err |= put_user(compat_ptr(p), &data->pInfo[0]);
 	err = get_user(p, &data32->pInfo[1]);
 	err |= put_user(compat_ptr(p), &data->pInfo[1]);
-	err = get_user(p, &data32->pInfo[0]);
+	/* m5c: this used to read pInfo[0/1] again (MTK copy-paste), so
+	 * the 64-bit handler wrote the config structs OVER the HAL's info
+	 * buffers and never filled the real config buffers.
+	 */
+	err = get_user(p, &data32->pConfig[0]);
 	err |= put_user(compat_ptr(p), &data->pConfig[0]);
-	err = get_user(p, &data32->pInfo[1]);
+	err = get_user(p, &data32->pConfig[1]);
 	err |= put_user(compat_ptr(p), &data->pConfig[1]);
 
 	return err;
@@ -3100,7 +3565,7 @@ static int compat_put_acdk_sensor_featurecontrol_struct(
 	return err;
 }
 
-static int compat_get_acdk_sensor_control_struct(COMPAT_ACDK_SENSOR_CONTROL_STRUCT __user *data32,
+static int compat_get_acdk_sensor_control_struct(struct COMPAT_ACDK_SENSOR_CONTROL_STRUCT __user *data32,
 						 struct ACDK_SENSOR_CONTROL_STRUCT __user *data)
 {
 	compat_uptr_t p;
@@ -3118,7 +3583,7 @@ static int compat_get_acdk_sensor_control_struct(COMPAT_ACDK_SENSOR_CONTROL_STRU
 	return err;
 }
 
-static int compat_put_acdk_sensor_control_struct(COMPAT_ACDK_SENSOR_CONTROL_STRUCT __user *data32,
+static int compat_put_acdk_sensor_control_struct(struct COMPAT_ACDK_SENSOR_CONTROL_STRUCT __user *data32,
 						 struct ACDK_SENSOR_CONTROL_STRUCT __user *data)
 {
 	/* compat_uptr_t p; */
@@ -3159,7 +3624,7 @@ static int compat_get_acdk_sensor_resolution_info_struct(
 
 static int compat_put_acdk_sensor_resolution_info_struct(struct COMPAT_ACDK_SENSOR_PRESOLUTION_STRUCT
 							 __user *data32,
-							 ACDK_SENSOR_PRESOLUTION_STRUCT __user *
+							 struct ACDK_SENSOR_PRESOLUTION_STRUCT __user *
 							 data)
 {
 	int err = 0;
@@ -3178,7 +3643,9 @@ static long CAMERA_HW_Ioctl_Compat(struct file *filp, unsigned int cmd, unsigned
 	if (!filp->f_op || !filp->f_op->unlocked_ioctl)
 		return -ENOTTY;
 
-	switch (cmd) {
+		pr_info("[kd_sensorlist] compat ioctl cmd=0x%08x (nr=%u size=%u)\n",
+		cmd, _IOC_NR(cmd), _IOC_SIZE(cmd));
+switch (cmd) {
 	case COMPAT_KDIMGSENSORIOC_X_GETINFO:
 		{
 			struct COMPAT_ACDK_SENSOR_GETINFO_STRUCT __user *data32;
@@ -3232,7 +3699,7 @@ static long CAMERA_HW_Ioctl_Compat(struct file *filp, unsigned int cmd, unsigned
 		}
 	case COMPAT_KDIMGSENSORIOC_X_CONTROL:
 		{
-			COMPAT_ACDK_SENSOR_CONTROL_STRUCT __user *data32;
+			struct COMPAT_ACDK_SENSOR_CONTROL_STRUCT __user *data32;
 			struct ACDK_SENSOR_CONTROL_STRUCT __user *data;
 			int err;
 			PK_DBG("[CAMERA SENSOR] CAOMPAT_KDIMGSENSORIOC_X_CONTROL\n");
@@ -3315,12 +3782,15 @@ static long CAMERA_HW_Ioctl_Compat(struct file *filp, unsigned int cmd, unsigned
 	case KDIMGSENSORIOC_X_RELEASE_I2C_TRIGGER_LOCK:
 	case KDIMGSENSORIOC_X_SET_SHUTTER_GAIN_WAIT_DONE:
 	case KDIMGSENSORIOC_X_SET_MCLK_PLL:
+	case KDIMGSENSORIOC_X_SET_MCLK_PLL_LEGACY:
 	case KDIMGSENSORIOC_X_SET_CURRENT_SENSOR:
 	case KDIMGSENSORIOC_X_SET_GPIO:
 	case KDIMGSENSORIOC_X_GET_ISP_CLK:
 		return filp->f_op->unlocked_ioctl(filp, cmd, arg);
 
 	default:
+		pr_info("[kd_sensorlist] compat ioctl cmd=0x%08x UNHANDLED -> -ENOIOCTLCMD\n",
+			cmd);
 		return -ENOIOCTLCMD;
 	}
 }
@@ -3364,6 +3834,13 @@ static long CAMERA_HW_Ioctl(struct file *a_pstFile,
 	}
 
 	pIdx = (u32 *) pBuff;
+	/* m5c: the camera HAL blob dies inside its own
+	 * getCurrentSensorType right after a probe, and the only way to tell
+	 * which request it made and what we answered is to name every command
+	 * and its result. One line in, one line out; PK_DBG here is pr_debug
+	 * and invisible on the device. */
+	pr_info("[kd_sensorlist] ioctl IN  cmd=0x%08x (nr=%u size=%u)\n",
+		a_u4Command, _IOC_NR(a_u4Command), _IOC_SIZE(a_u4Command));
 	switch (a_u4Command) {
 
 #if 0
@@ -3423,6 +3900,11 @@ static long CAMERA_HW_Ioctl(struct file *a_pstFile,
 		break;
 
 	case KDIMGSENSORIOC_X_SET_MCLK_PLL:
+	/* m5c: the stock HAL blob issues the 8-byte-struct variant of
+	 * this command (see kd_imgsensor.h); on/freq live at the same offsets,
+	 * and kdSetSensorMclk() never reads the TG tail member.
+	 */
+	case KDIMGSENSORIOC_X_SET_MCLK_PLL_LEGACY:
 		i4RetValue = kdSetSensorMclk(pBuff);
 		break;
 
@@ -3453,6 +3935,8 @@ static long CAMERA_HW_Ioctl(struct file *a_pstFile,
 
 	kfree(pBuff);
 CAMERA_HW_Ioctl_EXIT:
+	pr_info("[kd_sensorlist] ioctl OUT cmd=0x%08x ret=%d\n",
+		a_u4Command, i4RetValue);
 	mutex_unlock(&kdCam_Mutex);
 	return i4RetValue;
 }
@@ -3627,6 +4111,8 @@ static int CAMERA_HW_i2c_probe(struct i2c_client *client, const struct i2c_devic
 	g_pstI2Cclient = client;
 	/* set I2C clock rate */
 	g_pstI2Cclient->timing = 200;	/* 100k */
+	pr_info("[kd_sensorlist] client1 (camera_main) bound: i2c-%d dt-addr=0x%02x timing=%dkHz\n",
+		client->adapter ? client->adapter->nr : -1, client->addr, client->timing);
 	g_pstI2Cclient->ext_flag &= ~I2C_POLLING_FLAG;	/* No I2C polling busy waiting */
 
 	spin_unlock(&kdsensor_drv_lock);
@@ -3827,6 +4313,8 @@ static int CAMERA_HW_i2c_probe2(struct i2c_client *client, const struct i2c_devi
 
 	/* set I2C clock rate */
 	g_pstI2Cclient2->timing = 100;	/* 100k */
+	pr_info("[kd_sensorlist] client2 (camera_sub) bound: i2c-%d dt-addr=0x%02x timing=%dkHz\n",
+		client->adapter ? client->adapter->nr : -1, client->addr, client->timing);
 	g_pstI2Cclient2->ext_flag &= ~I2C_POLLING_FLAG;	/* No I2C polling busy waiting */
 	spin_unlock(&kdsensor_drv_lock);
 
@@ -4355,6 +4843,32 @@ static struct file_operations fcamera_proc_fops1 = {
 	.open = proc_camera_info_open,
 	.read = seq_read,
 };
+
+/* m5c: verbatim port from the 3.18 reference kd_sensorlist.c -
+ * the S5K4H8 driver records its OTP checksum status through this helper. */
+static char back_otp_checksum_info[20] = {0};
+static char front_otp_checksum_info[20] = {0};
+
+void mtk_eeprom_hw_otp_check_set(char *name, int otp_flag)
+{
+        pr_err("%s %d\n", __func__,__LINE__);
+        if(!strcmp("back",name)){
+                memset(back_otp_checksum_info,0,20*sizeof(char));
+                if (otp_flag == 0) {
+                        snprintf(back_otp_checksum_info,12,"%s","otp:back_ok\n");
+                } else {
+                        snprintf(back_otp_checksum_info,13,"%s","otp:back_err\n");
+                }
+        }else{
+                memset(front_otp_checksum_info,0,20*sizeof(char));
+                if (otp_flag == 0) {
+                        snprintf(front_otp_checksum_info,13,"%s","otp:front_ok\n");
+                } else {
+                        snprintf(front_otp_checksum_info,14,"%s","otp:front_err\n");
+                }
+        }
+}
+EXPORT_SYMBOL(mtk_eeprom_hw_otp_check_set);
 
 /*=======================================================================
   * CAMERA_HW_i2C_init()

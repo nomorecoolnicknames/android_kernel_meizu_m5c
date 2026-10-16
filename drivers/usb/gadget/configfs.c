@@ -1475,6 +1475,15 @@ err_comp_cleanup:
 }
 
 #ifdef CONFIG_USB_CONFIGFS_UEVENT
+#ifndef CONFIG_USB_G_ANDROID
+/* the deadman watchdog cancels its diagnostic deadline once
+ * userspace has brought the gadget up. On the legacy g_android path that
+ * flag lives in android.c, which is not built for a configfs gadget, so
+ * define it here and raise it when the composite reports CONFIGURED -
+ * the configfs equivalent of android0/enable being written. */
+int forge_userspace_alive;
+EXPORT_SYMBOL(forge_userspace_alive);
+#endif
 static void android_work(struct work_struct *data)
 {
 	struct gadget_info *gi = container_of(data, struct gadget_info, work);
@@ -1508,6 +1517,9 @@ static void android_work(struct work_struct *data)
 	}
 
 	if (status[1]) {
+#ifndef CONFIG_USB_G_ANDROID
+		forge_userspace_alive = 1;
+#endif
 		kobject_uevent_env(&android_device->kobj,
 					KOBJ_CHANGE, configured);
 		pr_info("%s: sent uevent %s\n", __func__, configured[0]);
@@ -1757,7 +1769,7 @@ static struct device_attribute *android_usb_attributes[] = {
 	NULL
 };
 
-static int android_device_create(struct gadget_info *gi)
+static int __maybe_unused android_device_create(struct gadget_info *gi)
 {
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
@@ -1800,7 +1812,7 @@ static int android_device_create(struct gadget_info *gi)
 	return 0;
 }
 
-static void android_device_destroy(void)
+static void __maybe_unused android_device_destroy(void)
 {
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
@@ -1874,8 +1886,12 @@ static struct config_group *gadgets_make(
 	if (!gi->composite.gadget_driver.function)
 		goto err;
 
+#ifndef CONFIG_USB_G_ANDROID
+	/* android0 emulation is only ours when the legacy gadget
+	 * doesn't own the class (see gadget_cfs_init). */
 	if (!acm_shortcut() && android_device_create(gi) < 0)
 		goto err;
+#endif
 
 	return &gi->group;
 
@@ -1887,7 +1903,9 @@ err:
 static void gadgets_drop(struct config_group *group, struct config_item *item)
 {
 	config_item_put(item);
+#ifndef CONFIG_USB_G_ANDROID
 	android_device_destroy();
+#endif
 }
 
 static struct configfs_group_operations gadgets_ops = {
@@ -1928,7 +1946,14 @@ static int __init gadget_cfs_init(void)
 
 	ret = configfs_register_subsystem(&gadget_subsys);
 
-#ifdef CONFIG_USB_CONFIGFS_UEVENT
+/* with the legacy android gadget enabled, /sys/class/android_usb
+ * belongs to android.c (late_initcall). This module_init runs earlier
+ * (device_initcall) and used to claim the class name first, so android.c's
+ * class_create came back -EEXIST and the legacy gadget silently never
+ * probed: no android0, ramdisk writes went nowhere, zero USB (p31-p37
+ * root cause, proven by the p37 expdb marker mirror: slots 102/103 never
+ * stamped while userspace was alive for ~197s). */
+#if defined(CONFIG_USB_CONFIGFS_UEVENT) && !defined(CONFIG_USB_G_ANDROID)
 	if (!acm_shortcut()) {
 	android_class = class_create(THIS_MODULE, "android_usb");
 	if (IS_ERR(android_class))

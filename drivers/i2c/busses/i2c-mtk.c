@@ -860,7 +860,17 @@ static int mt_i2c_do_transfer(struct mt_i2c *i2c)
 	ret = i2c_set_speed(i2c, I2C_CLK_RATE);
 #endif
 	if (ret) {
-		dev_info(i2c->dev, "Failed to set the speed\n");
+		/* m5c: name the numbers. This is where every transfer of
+		 * a client whose ->timing the caller set to an out-of-range
+		 * value dies with -EINVAL, and the old message said nothing
+		 * about which speed was asked for. */
+		dev_err(i2c->dev,
+			"Failed to set the speed: want %u Hz (ext %d/%u), bus %u Hz, clk %lu/%u\n",
+			i2c->ext_data.isEnable && i2c->ext_data.timing ?
+				i2c->ext_data.timing : i2c->speed_hz,
+			i2c->ext_data.isEnable, i2c->ext_data.timing,
+			i2c->speed_hz, clk_get_rate(i2c->clk_main),
+			i2c->clk_src_div);
 		return -EINVAL;
 	}
 

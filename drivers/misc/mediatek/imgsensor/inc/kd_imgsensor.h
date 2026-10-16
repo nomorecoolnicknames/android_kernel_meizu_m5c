@@ -78,6 +78,16 @@
 /* set mclk */
 #define KDIMGSENSORIOC_X_SET_MCLK_PLL \
 	_IOWR(IMGSENSORMAGIC, 60, struct ACDK_SENSOR_MCLK_STRUCT)
+/* m5c: same command as issued by the stock-derived camera HAL blob.
+ * The stock kernel's ACDK_SENSOR_MCLK_STRUCT is {u8 on; u32 freq} = 8 bytes
+ * (stock CAMERA_HW_Ioctl compares cmd against 0xC008693C), while this tree
+ * added a TG member, growing the struct to 12 bytes and the cmd to
+ * 0xC00C693C. The blob's ioctl therefore missed every case and returned
+ * -EPERM ("SeninfDrvImp setMclk1/2 Err ... KDIMGSENSORIOC_X_SET_MCLK_PLL"
+ * in logcat). Accept the legacy 8-byte number too; on/freq offsets match.
+ */
+#define KDIMGSENSORIOC_X_SET_MCLK_PLL_LEGACY \
+	_IOC(_IOC_READ | _IOC_WRITE, IMGSENSORMAGIC, 60, 8)
 #define KDIMGSENSORIOC_X_GETINFO2 \
 	_IOWR(IMGSENSORMAGIC, 65, struct IMAGESENSOR_GETINFO_STRUCT)
 /* set open/close sensor index */
@@ -223,6 +233,17 @@
 #define S5K8AAYX_SENSOR_ID                      0x08aa
 #define S5K5E8YX_SENSOR_ID                      0x5e80
 #define S5K5E8YXREAR2_SENSOR_ID                 0x5e80
+/* m5c: main S5K4H8 + per-module-variant ids, byte-identical to the
+ * 3.18 reference inc/kd_imgsensor.h (stock module vendors). */
+#define S5K4H8_SENSOR_ID                        0x4088
+#define S5K4H8_OFILM_SENSOR_ID                  0x4088
+#define S5K4H8_ST_SENSOR_ID                     0x4089
+#define S5K4H8_HOLITECH_SENSOR_ID               0x408A
+#define S5K4H8_SUNWIN_SENSOR_ID                 0x408B
+#define S5K5E8_ST_SENSOR_ID                     0x5E80
+#define S5K5E8_QH_SENSOR_ID                     0x5E81
+#define S5K5E8_HOLITECH_SENSOR_ID               0x5E82
+#define S5K5E8_SUNWIN_SENSOR_ID                 0x5E83
 /*HI*/
 #define HI841_SENSOR_ID                         0x0841
 #define HI707_SENSOR_ID                         0x00b8
@@ -416,6 +437,17 @@
 #define SENSOR_DRVNAME_S5K8AAYX_YUV             "s5k8aayx_yuv"
 #define SENSOR_DRVNAME_S5K5E8YX_MIPI_RAW        "s5k5e8yx_mipi_raw"
 #define SENSOR_DRVNAME_S5K5E8YXREAR2_MIPI_RAW   "s5k5e8yxrear2_mipi_raw"
+/* m5c: drvnames byte-identical to the 3.18 reference - the camera
+ * HAL blob takes the sensor identity from these entry names. */
+#define SENSOR_DRVNAME_S5K4H8_MIPI_RAW          "s5k4h8mipiraw"
+#define SENSOR_DRVNAME_S5K4H8_OFILM_MIPI_RAW    "s5k4h8ofilmmipiraw"
+#define SENSOR_DRVNAME_S5K4H8_ST_MIPI_RAW       "s5k4h8stmipiraw"
+#define SENSOR_DRVNAME_S5K4H8_HOLITECH_MIPI_RAW "s5k4h8holitechmipiraw"
+#define SENSOR_DRVNAME_S5K4H8_SUNWIN_MIPI_RAW   "s5k4h8sunwinmipiraw"
+#define SENSOR_DRVNAME_S5K5E8_ST_MIPI_RAW       "s5k5e8stmipiraw"
+#define SENSOR_DRVNAME_S5K5E8_QH_MIPI_RAW       "s5k5e8qhmipiraw"
+#define SENSOR_DRVNAME_S5K5E8_HOLITECH_MIPI_RAW "s5k5e8holitechmipiraw"
+#define SENSOR_DRVNAME_S5K5E8_SUNWIN_MIPI_RAW   "s5k5e8sunwinmipiraw"
 /*HI*/
 #define SENSOR_DRVNAME_HI843_MIPI_RAW           "hi843mipiraw"
 #define SENSOR_DRVNAME_HI841_MIPI_RAW           "hi841_mipi_raw"

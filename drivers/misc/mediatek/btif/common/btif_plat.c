@@ -216,12 +216,18 @@ static void _btif_set_default_setting(void)
 		mtk_btif_info.base = (unsigned long)of_iomap(node, 0);
 		BTIF_INFO_FUNC("get btif irq(%d),register base(0x%lx)\n",
 			mtk_btif_info.p_irq->irq_id, mtk_btif_info.base);
+		if (mtk_btif_info.base == 0)
+			BTIF_ERR_FUNC("of_iomap btif reg[0] fail, base is 0\n");
 	} else {
 		BTIF_ERR_FUNC("get btif device node fail\n");
 	}
 
-	/* get the interrupt line behaviour */
-	if (of_property_read_u32_array(node, "interrupts", irq_info, ARRAY_SIZE(irq_info))) {
+	/* get the interrupt line behaviour: try the combined 9-cell layout
+	 * first, then the single 3-cell layout of legacy/stock DTBs (m5c);
+	 * the flag is cell [2] of the first entry in both cases
+	 */
+	if (of_property_read_u32_array(node, "interrupts", irq_info, ARRAY_SIZE(irq_info)) &&
+	    of_property_read_u32_array(node, "interrupts", irq_info, 3)) {
 		BTIF_ERR_FUNC("get interrupt flag from DTS fail\n");
 	} else {
 		mtk_btif_info.p_irq->irq_flags = irq_info[2];
@@ -492,6 +498,11 @@ int hal_btif_hw_init(struct _MTK_BTIF_INFO_STR_ *p_btif)
 /*Chaozhong: To be implement*/
 	int i_ret = -1;
 	unsigned long base = p_btif->base;
+
+	if (base == 0) {
+		BTIF_ERR_FUNC("BTIF base not initialized, missing DTS resource?\n");
+		return ERR_INVALID_PAR;
+	}
 
 #if NEW_TX_HANDLING_SUPPORT
 	_btif_tx_fifo_reset(p_btif);

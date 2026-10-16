@@ -12,6 +12,7 @@
  */
 
 #include "cmdq_driver.h"
+#include "cmdq_legacy_event.h"
 #include "cmdq_core.h"
 #include "cmdq_device.h"
 #include "cmdq_mdp_common.h"
@@ -540,9 +541,65 @@ bool cmdq_driver_support_wait_and_receive_event_in_same_tick(void)
 #endif
 }
 
+/*
+ * p49 (camera lane, 2026-09-03): legacy subsys id space.
+ *
+ * p48 served the 27-entry SIZE the 2016 blobs expect, but filled it with a
+ * straight memcpy - that TRUNCATES our table and leaves OUR id space in it.
+ * The two trees agree on ids 0..23 and diverge from 24 on: the 3.18 tree this
+ * device's blobs were built against has CAMSYS=24, PWM_SW=25, DIP_A0_SW=26,
+ * while ours has GCE=24, VDEC=25..28, CAMSYS=29, PWM_SW=35, DIP_A0_SW=37.
+ * So a blob reading index 24 for CAMSYS got GCE's base, and the real
+ * CAMSYS / PWM_SW / DIP_A0_SW fell outside the 27-entry window entirely.
+ * All three that diverge are camera-side blocks.
+ *
+ * The map is written by NAME on purpose: if a future kernel revision moves an
+ * id again, the mapping follows the symbol instead of silently re-breaking.
+ * Generated from drivers/misc/mediatek/cmdq/v2/cmdq_subsys_common.h of the
+ * 3.18 tree; every one of its 27 names still exists here, so there are no
+ * holes to invent.
+ */
+/* The size is deliberately implicit: with an explicit [CMDQ_SUBSYS_MAX_COUNT_LEGACY] a missing
+ * entry is silently zero-filled, ARRAY_SIZE stays 27 and the check goes blind --
+ * verified with a negative test, which did not fail. With an implicit size a lost tail
+ * trips the BUILD_BUG_ON on ARRAY_SIZE at once.
+ */
+static const int cmdq_legacy_subsys_map[] = {
+	[0] = CMDQ_SUBSYS_G3D_CONFIG_BASE,
+	[1] = CMDQ_SUBSYS_MMSYS_CONFIG,
+	[2] = CMDQ_SUBSYS_DISP_DITHER,
+	[3] = CMDQ_SUBSYS_NA,
+	[4] = CMDQ_SUBSYS_IMGSYS,
+	[5] = CMDQ_SUBSYS_VDEC_GCON,
+	[6] = CMDQ_SUBSYS_VENC_GCON,
+	[7] = CMDQ_SUBSYS_CONN_PERIPHERALS,
+	[8] = CMDQ_SUBSYS_TOPCKGEN,
+	[9] = CMDQ_SUBSYS_KP,
+	[10] = CMDQ_SUBSYS_SCP_SRAM,
+	[11] = CMDQ_SUBSYS_INFRA_NA3,
+	[12] = CMDQ_SUBSYS_INFRA_NA4,
+	[13] = CMDQ_SUBSYS_SCP,
+	[14] = CMDQ_SUBSYS_MCUCFG,
+	[15] = CMDQ_SUBSYS_GCPU,
+	[16] = CMDQ_SUBSYS_USB0,
+	[17] = CMDQ_SUBSYS_USB_SIF,
+	[18] = CMDQ_SUBSYS_AUDIO,
+	[19] = CMDQ_SUBSYS_MSDC0,
+	[20] = CMDQ_SUBSYS_MSDC1,
+	[21] = CMDQ_SUBSYS_MSDC2,
+	[22] = CMDQ_SUBSYS_MSDC3,
+	[23] = CMDQ_SUBSYS_AP_DMA,
+	[24] = CMDQ_SUBSYS_CAMSYS,
+	[25] = CMDQ_SUBSYS_PWM_SW,
+	[26] = CMDQ_SUBSYS_DIP_A0_SW,
+};
+
 static long cmdq_ioctl(struct file *pFile, unsigned int code,
 		       unsigned long param)
 {
+
+	/* m5c: which of the two accepted job layouts this call uses */
+	bool job_is_legacy = false;
 	struct cmdqCommandStruct command;
 	struct cmdqJobStruct job;
 	int count[CMDQ_MAX_ENGINE_COUNT];
@@ -554,6 +611,20 @@ static long cmdq_ioctl(struct file *pFile, unsigned int code,
 	/* backup value after task release */
 	uint32_t regCount = 0, regCountUserSpace = 0, regUserToken = 0;
 	int capBits = 0;
+
+	/* m5c: both layouts are pinned. 232 is what this kernel builds;
+	 * 216 is what the m5c userspace blobs send (see cmdq_driver.h). If
+	 * either trips, someone changed cmdqCommandStruct and the blobs'
+	 * ioctl number no longer matches - fix the layout, do not bump these. */
+	/* both lengths, not only the new one. 3764 - 3236 = 528 = 12 * 44,
+	 * i.e. exactly twelve extra entries of sizeof(SubsysStruct). */
+	BUILD_BUG_ON(sizeof(struct cmdqDTSDataStruct) != 3764);
+	BUILD_BUG_ON(sizeof(struct cmdqDTSDataStruct_legacy) != 3236);
+	BUILD_BUG_ON(ARRAY_SIZE(cmdq_legacy_subsys_map) !=
+		     CMDQ_SUBSYS_MAX_COUNT_LEGACY);
+	BUILD_BUG_ON(sizeof(struct cmdqJobStruct) != 232);
+	BUILD_BUG_ON(CMDQ_JOB_LEGACY_SIZE != 216);
+	BUILD_BUG_ON(CMDQ_JOB_LEGACY_CMD_SIZE != 208);
 
 	switch (code) {
 	case CMDQ_IOCTL_EXEC_COMMAND:
@@ -579,8 +650,25 @@ static long cmdq_ioctl(struct file *pFile, unsigned int code,
 			return -EFAULT;
 		}
 		break;
+	case CMDQ_IOCTL_ASYNC_JOB_EXEC_LEGACY:
 	case CMDQ_IOCTL_ASYNC_JOB_EXEC:
-		if (copy_from_user(&job,
+		/* m5c: the blobs' job struct is a strict 216-byte prefix of
+		 * ours (no userDebugStr/userDebugStrLen); see cmdq_driver.h.
+		 * Read the prefix, then hJob from where THEY put it, and leave the
+		 * two fields we added zeroed. */
+		job_is_legacy = (code == CMDQ_IOCTL_ASYNC_JOB_EXEC_LEGACY);
+		if (job_is_legacy) {
+			memset(&job, 0, sizeof(job));
+			if (copy_from_user(&job.command, (void *)param,
+					   CMDQ_JOB_LEGACY_CMD_SIZE) ||
+			    copy_from_user(&job.hJob,
+					   (void *)(param + CMDQ_JOB_LEGACY_CMD_SIZE),
+					   sizeof(job.hJob))) {
+				CMDQ_ERR(
+					"CMDQ_IOCTL_ASYNC_JOB_EXEC(legacy) copy_from_user failed\n");
+				return -EFAULT;
+			}
+		} else if (copy_from_user(&job,
 			(void *)param,
 			sizeof(struct cmdqJobStruct))) {
 			CMDQ_ERR(
@@ -635,7 +723,18 @@ static long cmdq_ioctl(struct file *pFile, unsigned int code,
 
 		if (status >= 0) {
 			job.hJob = (unsigned long)pTask;
-			if (copy_to_user((void *)param, (void *)&job,
+			if (job_is_legacy) {
+				/* m5c: write back inside THEIR layout */
+				if (copy_to_user((void *)param, (void *)&job.command,
+						 CMDQ_JOB_LEGACY_CMD_SIZE) ||
+				    copy_to_user((void *)(param + CMDQ_JOB_LEGACY_CMD_SIZE),
+						 (void *)&job.hJob,
+						 sizeof(job.hJob))) {
+					CMDQ_ERR(
+						"CMDQ_IOCTL_ASYNC_JOB_EXEC(legacy) copy_to_user failed\n");
+					return -EFAULT;
+				}
+			} else if (copy_to_user((void *)param, (void *)&job,
 					 sizeof(struct cmdqJobStruct))) {
 				CMDQ_ERR(
 					"CMDQ_IOCTL_ASYNC_JOB_EXEC copy_to_user failed\n");
@@ -837,6 +936,74 @@ static long cmdq_ioctl(struct file *pFile, unsigned int code,
 			return -EFAULT;
 		}
 		break;
+	case CMDQ_IOCTL_QUERY_DTS_LEGACY:
+		/* p48 + same data in the 27-subsys layout the
+		 * userspace blobs expect (see cmdq_def.h), REMAPPED into the
+		 * legacy id space. */
+		do {
+			struct cmdqDTSDataStruct *pDtsData;
+			struct cmdqDTSDataStruct_legacy *pLegacy;
+			int ret_legacy = 0;
+			int i_legacy;
+
+			pDtsData = cmdq_core_get_whole_DTS_Data();
+			pLegacy = kzalloc(sizeof(*pLegacy), GFP_KERNEL);
+			if (!pLegacy)
+				return -ENOMEM;
+
+			/* m5c: the events too -
+			 * cmdq_legacy_event.h; unknown legacy ids stay invalid. */
+			for (i_legacy = 0; i_legacy < CMDQ_SYNC_TOKEN_MAX;
+			     i_legacy++)
+				pLegacy->eventTable[i_legacy] =
+					CMDQ_SYNC_TOKEN_INVALID;
+			for (i_legacy = 0;
+			     i_legacy < ARRAY_SIZE(cmdq_legacy_event_map);
+			     i_legacy++) {
+				const struct cmdq_legacy_event *e =
+					&cmdq_legacy_event_map[i_legacy];
+
+				pLegacy->eventTable[e->legacy] =
+					pDtsData->eventTable[e->now];
+			}
+			for (i_legacy = 0;
+			     i_legacy < CMDQ_SUBSYS_MAX_COUNT_LEGACY;
+			     i_legacy++) {
+				int id = cmdq_legacy_subsys_map[i_legacy];
+
+				/* A wrong NAME in the map cannot be caught by
+				 * BUILD_BUG_ON without writing a tautology
+				 * (the map is const, so an element read is not
+				 * an integer constant expression).  What an
+				 * editing slip actually produces is a
+				 * duplicate or an out-of-range id, and that is
+				 * checkable - so check it, and refuse rather
+				 * than hand userspace a silently wrong table.
+				 */
+				if (id < 0 || id >= CMDQ_SUBSYS_MAX_COUNT ||
+				    (i_legacy > 0 && id == 0)) {
+					CMDQ_ERR(
+						"legacy subsys map broken at %d (id %d)\n",
+						i_legacy, id);
+					kfree(pLegacy);
+					return -EINVAL;
+				}
+				pLegacy->subsys[i_legacy] =
+					pDtsData->subsys[id];
+			}
+			memcpy(pLegacy->MDPBaseAddress, pDtsData->MDPBaseAddress,
+			       sizeof(pLegacy->MDPBaseAddress));
+
+			if (copy_to_user((void *)param, pLegacy,
+					 sizeof(*pLegacy))) {
+				CMDQ_ERR("Copy legacy DTS to user failed\n");
+				ret_legacy = -EFAULT;
+			}
+			kfree(pLegacy);
+			if (ret_legacy)
+				return ret_legacy;
+		} while (0);
+		break;
 	case CMDQ_IOCTL_QUERY_DTS:
 		do {
 			struct cmdqDTSDataStruct *pDtsData;
@@ -880,12 +1047,14 @@ static long cmdq_ioctl_compat(struct file *pFile, unsigned int code,
 	case CMDQ_IOCTL_QUERY_USAGE:
 	case CMDQ_IOCTL_EXEC_COMMAND:
 	case CMDQ_IOCTL_ASYNC_JOB_EXEC:
+	case CMDQ_IOCTL_ASYNC_JOB_EXEC_LEGACY:	/* m5c: 216-byte blob layout */
 	case CMDQ_IOCTL_ASYNC_JOB_WAIT_AND_CLOSE:
 	case CMDQ_IOCTL_ALLOC_WRITE_ADDRESS:
 	case CMDQ_IOCTL_FREE_WRITE_ADDRESS:
 	case CMDQ_IOCTL_READ_ADDRESS_VALUE:
 	case CMDQ_IOCTL_QUERY_CAP_BITS:
 	case CMDQ_IOCTL_QUERY_DTS:
+	case CMDQ_IOCTL_QUERY_DTS_LEGACY:	/* p48 */
 	case CMDQ_IOCTL_NOTIFY_ENGINE:
 		/* All ioctl structures should be the same size in 32-bit and
 		 * 64-bit linux.
@@ -1014,14 +1183,30 @@ static int cmdq_probe(struct platform_device *pDevice)
 
 	CMDQ_MSG("CMDQ driver probe begin\n");
 
+	/* step ladder */
+	{
+		extern void forge_kmark_ptr(int, unsigned long);
+		forge_kmark_ptr(126, 0x42UL);
+	}
+
 	/* Function link */
 	cmdq_virtual_function_setting();
 
 	/* init cmdq device related data */
 	cmdq_dev_init(pDevice);
 
+	{
+		extern void forge_kmark_ptr(int, unsigned long);
+		forge_kmark_ptr(126, 0x43UL);	/* dev_init done */
+	}
+
 	/* init cmdq context */
 	cmdqCoreInitialize();
+
+	{
+		extern void forge_kmark_ptr(int, unsigned long);
+		forge_kmark_ptr(126, 0x44UL);	/* core initialized */
+	}
 
 	status =
 		alloc_chrdev_region(&gCmdqDevNo, 0, 1, CMDQ_DRIVER_DEVICE_NAME);
@@ -1153,6 +1338,11 @@ static int __init cmdq_init(void)
 {
 	int status;
 
+	/* display step ladder (see mtkfb.c) */
+	{
+		extern void forge_kmark_ptr(int, unsigned long);
+		forge_kmark_ptr(126, 0x40UL);
+	}
 	CMDQ_MSG("CMDQ driver init begin\n");
 
 	/* Initialize group callback */
@@ -1195,6 +1385,10 @@ static int __init cmdq_init(void)
 
 	CMDQ_MSG("CMDQ driver init end\n");
 
+	{
+		extern void forge_kmark_ptr(int, unsigned long);
+		forge_kmark_ptr(126, 0x41UL);	/* p45 */
+	}
 	return 0;
 }
 

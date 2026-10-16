@@ -36,6 +36,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/delay.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
@@ -2481,6 +2482,23 @@ static void cmdq_core_auto_release_task(struct TaskStruct *pTask)
 		/* this is called via auto release work, no need to put in work
 		 * queue again
 		 */
+		/* p50 (find by display-dvfs): the sibling check
+		 * cmdqCoreAutoReleaseTask() prints "[Double INIT WORK]" here,
+		 * this one did not - the authors knew the hazard and guarded
+		 * only one of the two entries.  This is the branch that puts a
+		 * task back on taskFreeList while its work item may still be
+		 * queued, so say so: diagnosis only, no behaviour change, but
+		 * it turns a later panic into a readable line naming the task.
+		 */
+		/* m5c, 2026-10-06: print only the hazard itself.  On
+		 * A13 this branch runs about 40 times a second with
+		 * work_pending 0 - the ordinary re-entry from the auto-release
+		 * work - and those ERR lines flooded the console and ramoops
+		 * and marked every display-probe run ENV-DIRTY. */
+		if (work_pending(&pTask->autoReleaseWork))
+			CMDQ_ERR(
+				"[Double INIT WORK] release without work queue, pTask(0x%p) thread(%d) work_pending(1)\n",
+				pTask, pTask->thread);
 		cmdq_core_release_task(pTask);
 	} else {
 		/* Not auto release work, use for auto release task ! */
@@ -3294,22 +3312,85 @@ bool cmdq_core_task_is_jump_inside(struct TaskStruct *pTask)
 		jump_to_pa < last_pa + CMDQ_CMD_BUFFER_SIZE);
 }
 
+/* how often the reuse filter below actually fired.  A gate nobody
+ * can see fire is a gate nobody knows is working, so this is printed, not just
+ * counted.
+ */
+static unsigned long long cmdq_forge_reuse_skipped;
+
+/*
+ * race amplifier for verifying the p50 filter, default OFF.
+ *
+ * The panic needs a coincidence: a task released while its autoReleaseWork is
+ * still queued, AND that same task handed back out of taskFreeList before the
+ * work has run.  Measured on #21 the first half happens once per ~1400 releases
+ * and the second half not at all in a 190 s session, so waiting for it produces
+ * a negative result indistinguishable from "not reproduced".
+ *
+ * Note the release workqueues are created with create_singlethread_workqueue(),
+ * i.e. alloc_ordered_workqueue(..., max_active = 1): capping max_active is
+ * therefore a no-op, it is already 1.  What is scarce is TIME - the window
+ * between release and reuse.  Sleeping at the head of the handler stalls that
+ * ordered queue, so every later release finds its work still queued and the
+ * free list fills with pending-work tasks: both halves widen at once.
+ *
+ * Default 0 keeps behaviour identical, so ONE kernel serves as both control and
+ * experiment - no reflash between the two arms, and no chance of comparing
+ * measurements taken on different images.
+ *   /sys/module/cmdq_core/parameters/forge_amp_ms
+ */
+static int cmdq_forge_amp_ms;
+module_param_named(forge_amp_ms, cmdq_forge_amp_ms, int, 0644);
+MODULE_PARM_DESC(forge_amp_ms,
+		 "forge: stall CMDQ auto-release handler N ms to widen the reuse race (0 = off)");
+
 static struct TaskStruct *cmdq_core_find_free_task(void)
 {
 	struct TaskStruct *pTask = NULL;
+	struct TaskStruct *pIter = NULL;
 
 	mutex_lock(&gCmdqTaskMutex);
 
-	/* Pick from free list first; */
-	/* create one if there is no free entry. */
-	if (list_empty(&gCmdqContext.taskFreeList)) {
-		pTask = cmdq_core_task_create();
-	} else {
-		pTask = list_first_entry(&(gCmdqContext.taskFreeList),
-					 struct TaskStruct, listEntry);
+	/*
+	 * p50 (camera lane, 2026-09-03): do not recycle a task whose
+	 * autoReleaseWork is still queued.
+	 *
+	 * Stock MTK defect, not ours.  cmdqCoreAutoReleaseTask() guards against
+	 * a double INIT_WORK with pTask->useWorkQueue, but that guard does not
+	 * survive REUSE of the structure: cmdq_core_auto_release_task() may put
+	 * a task straight onto taskFreeList while its work item is still linked
+	 * on the workqueue's delayed_works (which happens once the release wq
+	 * saturates), and cmdq_core_acquire_task() then resets useWorkQueue to
+	 * 0.  The next release passes the guard and re-inits a work item that is
+	 * still on that list, clearing WORK_STRUCT_PWQ while the list entry
+	 * stays.  Later pwq_dec_nr_in_flight() -> pwq_activate_first_delayed()
+	 * gets a NULL pwq out of get_work_pwq() and the kernel dies at VA 0 -
+	 * measured on #19, panic inside the CMDQ timeout dump itself.
+	 *
+	 * work_pending() is the exact predicate: it is set while the item is
+	 * queued (delayed or not) and cleared by process_one_work() before the
+	 * callback runs, i.e. exactly while re-init would corrupt the list.
+	 * Skipping such a task leaks nothing - it returns to circulation as
+	 * soon as its work has run.
+	 */
+	list_for_each_entry(pIter, &gCmdqContext.taskFreeList, listEntry) {
+		if (work_pending(&pIter->autoReleaseWork)) {
+			cmdq_forge_reuse_skipped++;
+			if ((cmdq_forge_reuse_skipped % 100) == 1)
+				CMDQ_ERR(
+					"forge-cmdqreuse: skipped=%llu (task 0x%p work still queued)\n",
+					cmdq_forge_reuse_skipped, pIter);
+			continue;
+		}
+		pTask = pIter;
 		/* remove from free list */
 		list_del_init(&(pTask->listEntry));
+		break;
 	}
+
+	/* free list empty, or every entry still has work queued */
+	if (pTask == NULL)
+		pTask = cmdq_core_task_create();
 
 	mutex_unlock(&gCmdqTaskMutex);
 
@@ -8723,6 +8804,13 @@ static void cmdq_core_auto_release_work(struct work_struct *workItem)
 	int32_t commandSize = 0;
 	struct CmdBufferStruct *cmd_buffer = NULL;
 	uint32_t *copy_ptr = NULL;
+
+	/* see cmdq_forge_amp_ms.  After the declarations (C90), before
+	 * any work is done.  Clamped so a typo cannot wedge the device; 0 costs
+	 * nothing.
+	 */
+	if (cmdq_forge_amp_ms > 0)
+		msleep(min(cmdq_forge_amp_ms, 200));
 
 	pTask = container_of(workItem, struct TaskStruct, autoReleaseWork);
 

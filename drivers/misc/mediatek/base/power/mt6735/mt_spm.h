@@ -330,6 +330,7 @@ typedef void (*twam_handler_t) (struct twam_sig *twamsig);
 
 /* check if spm firmware ready */
 extern int spm_load_firmware_status(void);
+extern int spm_suspend_firmware_status(void);
 
 /* for power management init */
 extern int spm_module_init(void);

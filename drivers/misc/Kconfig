@@ -800,4 +800,16 @@ source "drivers/misc/genwqe/Kconfig"
 source "drivers/misc/echo/Kconfig"
 source "drivers/misc/cxl/Kconfig"
 source "drivers/misc/mediatek/Kconfig"
+
+config FORGE_M5C_BOOTGUARD
+	bool "Meizu M5c: return a failed test boot to TWRP through the BCB"
+	depends on BLOCK && PROC_FS
+	default n
+	help
+	  Writes "boot-recovery" into the bootloader message on the "para"
+	  partition (p6) as soon as it exists, so that a panic, watchdog or
+	  fatal reboot of this boot ends in TWRP. Userspace disarms it on
+	  sys.boot_completed through /proc/forge_bootguard; otherwise the
+	  kernel restarts into TWRP after forge_bootguard_deadline seconds
+	  (default 900). For unattended test boots of the M5c only.
 endmenu

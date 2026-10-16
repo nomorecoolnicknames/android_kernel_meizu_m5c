@@ -52,6 +52,10 @@ static ssize_t show_pcm_desc(const struct pcm_desc *pcmdesc, char *buf)
 {
 	char *p = buf;
 
+	/* MT6735M sets no static suspend/dpidle/sodi pcmdesc */
+	if (!pcmdesc)
+		return -ENODEV;
+
 	p += sprintf(p, "version = %s\n", pcmdesc->version);
 	p += sprintf(p, "base = 0x%p\n", pcmdesc->base);
 	p += sprintf(p, "size = %u\n", pcmdesc->size);

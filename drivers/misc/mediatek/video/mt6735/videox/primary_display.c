@@ -88,6 +88,34 @@ static int is_hwc_update_frame;
 unsigned int gEnableLowPowerFeature = 0;
 /* int _trigger_display_interface(int blocking, void *callback, unsigned int userdata); */
 
+/*
+ * tear-probe + gate re-arm (2026-08-25).
+ *
+ * In video mode every per-frame config batch on cmdq_handle_config begins
+ * with WFE(no-clear) on DISP_RDMA0_EOF; the ONLY thing that ever clears that
+ * event is the cmdq trigger loop.  If the loop is dead or stuck, the flag
+ * stays set from the first frame on, the head wait degenerates into a no-op
+ * and every batch (OVL L0_ADDR included) executes at FLUSH time - i.e. in
+ * the middle of the scan-out, at SurfaceFlinger's fixed commit phase.  That
+ * is exactly a stationary horizontal tear.
+ *
+ * forge_gate_arm=1 makes the gate self-sufficient: discard the possibly
+ * stale edge, then wait for a fresh one.  With a healthy trigger loop the
+ * extra clear is a no-op (the flag is already 0 mid-frame).  Runtime A/B:
+ * "forgegate:0/1" > /sys/kernel/debug/dispsys (the batch is re-recorded
+ * every frame, so it applies within one frame, no reflash needed).
+ *
+ * forge_gate_slot[0] = RDMA0 IN_LINE_CNT sampled by the GCE right after the
+ * gate opens (the scanline at which the new config starts being applied);
+ * [1] = the same counter after all config writes.  forge_loop_slot[0] is
+ * rewritten by every trigger-loop iteration (heartbeat).  Slots live in
+ * DRAM and are read with cmdqBackupReadSlot - no GCE register access from
+ * the CPU, safe regardless of the GCE clock state.
+ */
+unsigned int forge_gate_arm = 1;
+static cmdqBackupSlotHandle forge_gate_slot;
+static cmdqBackupSlotHandle forge_loop_slot;
+
 int primary_display_use_cmdq = CMDQ_DISABLE;
 int primary_display_use_m4u = 1;
 #if defined(MTK_OVL_DECOUPLE_SUPPORT)
@@ -1721,6 +1749,15 @@ static void _cmdq_build_trigger_loop(void)
 		/* wait and clear rdma0_sof for vfp change */
 		cmdqRecClearEventToken(pgc->cmdq_handle_trigger, CMDQ_EVENT_DISP_RDMA0_SOF);
 
+		/* heartbeat - rewritten on every loop iteration; a
+		 * value frozen at the CPU-written poison means the loop is
+		 * dead/stuck (see forge_dump_cmdq_gate) */
+		if (!forge_loop_slot)
+			cmdqBackupAllocateSlot(&forge_loop_slot, 1);
+		if (forge_loop_slot)
+			cmdqRecBackupRegisterToSlot(pgc->cmdq_handle_trigger, forge_loop_slot, 0,
+						    (uint32_t)disp_addr_convert(DISP_REG_RDMA_IN_P_CNT));
+
 		if (gEnableSWTrigger == 1)
 			DISP_REG_SET(pgc->cmdq_handle_trigger, DISP_REG_CONFIG_MUTEX_EN(DISP_OVL_SEPARATE_MUTEX_ID), 1);
 
@@ -1899,6 +1936,10 @@ static void _cmdq_start_trigger_loop(void)
 	/* cmdqRecDumpCommand(pgc->cmdq_handle_trigger); */
 	/* this should be called only once because trigger loop will nevet stop */
 	ret = cmdqRecStartLoop(pgc->cmdq_handle_trigger);
+	/* a failed StartLoop used to be silent; a dead trigger loop
+	 * leaves DISP_RDMA0_EOF permanently set and breaks the frame gate */
+	if (ret != 0)
+		DISPERR("forge: cmdqRecStartLoop FAILED ret=%d\n", ret);
 	if (!primary_display_is_video_mode()) {
 		/* Need set esd check eof synctoken to let trigger loop go. */
 		if (_need_wait_esd_eof())
@@ -1919,7 +1960,7 @@ static void _cmdq_start_trigger_loop(void)
 	if (_is_decouple_mode(pgc->session_mode))
 		cmdqCoreSetEvent(CMDQ_EVENT_DISP_WDMA0_EOF);
 
-	pr_warn("[DISP]primary display START cmdq trigger loop finished\n");
+	pr_warn("[DISP]primary display START cmdq trigger loop finished, ret=%d\n", ret);
 #endif
 }
 
@@ -2009,9 +2050,13 @@ static void _cmdq_flush_config_handle_mira(void *handle, int blocking)
 static void _cmdq_insert_wait_frame_done_token(void)
 {
 #ifndef MTK_FB_CMDQ_DISABLE
-	if (primary_display_is_video_mode())
+	if (primary_display_is_video_mode()) {
+		/* self-armed gate - drop a stale edge first (no-op
+		 * when the trigger loop is alive), see forge_gate_arm above */
+		if (forge_gate_arm)
+			cmdqRecClearEventToken(pgc->cmdq_handle_config, CMDQ_EVENT_MUTEX0_STREAM_EOF);
 		cmdqRecWaitNoClear(pgc->cmdq_handle_config, CMDQ_EVENT_MUTEX0_STREAM_EOF);
-	else
+	} else
 		cmdqRecWaitNoClear(pgc->cmdq_handle_config, CMDQ_SYNC_TOKEN_STREAM_EOF);
 
 	dprec_event_op(DPREC_EVENT_CMDQ_WAIT_STREAM_EOF);
@@ -2021,9 +2066,12 @@ static void _cmdq_insert_wait_frame_done_token(void)
 void _cmdq_insert_wait_frame_done_token_mira(void *handle)
 {
 #ifndef MTK_FB_CMDQ_DISABLE
-	if (primary_display_is_video_mode())
+	if (primary_display_is_video_mode()) {
+		/* same self-armed gate as the config handle */
+		if (forge_gate_arm)
+			cmdqRecClearEventToken(handle, CMDQ_EVENT_MUTEX0_STREAM_EOF);
 		cmdqRecWaitNoClear(handle, CMDQ_EVENT_MUTEX0_STREAM_EOF);
-	else
+	} else
 		cmdqRecWaitNoClear(handle, CMDQ_SYNC_TOKEN_STREAM_EOF);
 
 	dprec_event_op(DPREC_EVENT_CMDQ_WAIT_STREAM_EOF);
@@ -3074,6 +3122,13 @@ int _trigger_display_interface(int blocking, void *callback, unsigned int userda
 			0, DISP_REG_OVL0_STATE_PA);
 		cmdqRecBackupRegisterToSlot(pgc->cmdq_handle_config, pgc->ovl_status_info,
 			1, DISP_REG_OVL0_STATUS_PA);
+		/* scanline after all config writes of this batch */
+		if (forge_gate_slot) {
+			cmdqRecBackupRegisterToSlot(pgc->cmdq_handle_config, forge_gate_slot, 2,
+						    (uint32_t)disp_addr_convert(DISP_REG_RDMA_IN_LINE_CNT));
+			cmdqRecBackupRegisterToSlot(pgc->cmdq_handle_config, forge_gate_slot, 3,
+						    (uint32_t)disp_addr_convert(DISP_REG_RDMA_OUT_LINE_CNT));
+		}
 	}
 
 	if (_should_flush_cmdq_config_handle())
@@ -3093,9 +3148,22 @@ int _trigger_display_interface(int blocking, void *callback, unsigned int userda
 		if (primary_display_is_video_mode() == 1)
 			disp_set_sodi(1, pgc->cmdq_handle_config);
 
-		if (primary_display_is_video_mode() == 1)
+		if (primary_display_is_video_mode() == 1) {
+			/* self-armed frame gate (see forge_gate_arm at
+			 * the top of this file) + record the scanline at
+			 * which the gate opened for the NEXT batch */
+			if (forge_gate_arm)
+				cmdqRecClearEventToken(pgc->cmdq_handle_config, CMDQ_EVENT_DISP_RDMA0_EOF);
 			cmdqRecWaitNoClear(pgc->cmdq_handle_config, CMDQ_EVENT_DISP_RDMA0_EOF);
-		else
+			if (!forge_gate_slot)
+				cmdqBackupAllocateSlot(&forge_gate_slot, 4);
+			if (forge_gate_slot) {
+				cmdqRecBackupRegisterToSlot(pgc->cmdq_handle_config, forge_gate_slot, 0,
+							    (uint32_t)disp_addr_convert(DISP_REG_RDMA_IN_LINE_CNT));
+				cmdqRecBackupRegisterToSlot(pgc->cmdq_handle_config, forge_gate_slot, 1,
+							    (uint32_t)disp_addr_convert(DISP_REG_RDMA_OUT_LINE_CNT));
+			}
+		} else
 			_cmdq_insert_wait_frame_done_token();
 
 		/* 3. disable AODI by CMDQ before config */
@@ -4519,6 +4587,236 @@ static int _ovl_ext_fence_release_callback(uint32_t userdata)
 	return ret;
 }
 
+/* tear-probe (2026-08-29): hold input-layer release fences back by
+ * this many extra frames (debugfs "forgerel:N", default 0 = stock).
+ * The pixel forensics of the first HARD pair show the OVL scanning a
+ * buffer while the producer repaints it (old frame above a tile-sharp
+ * row-640 boundary, half-rendered new frame below).  If the cause is a
+ * premature release on this timeline, one extra frame of holding makes
+ * the stitch vanish (at some cost in latency and maybe fps); if the
+ * stitch survives, the producer is not honouring these fences at all
+ * and the fault is in the fence transport, not the timing.  Values
+ * below the timeline are a safe no-op in mtkfb_release_fence. */
+unsigned int forge_rel_extra;
+
+/* p63 (2026-08-30): WHERE in the frame does the layer release fence
+ * signal, and hold it to the end of the frame scan-out.
+ *
+ * Stock signal point is this very file: _ovl_fence_release_callback is the
+ * async-flush completion callback of the per-frame config batch, and the
+ * batch is [wait fresh RDMA0_EOF] + [OVL register writes] + [slot backups].
+ * The callback therefore runs right after the register COMMIT - the latch
+ * point of config N - and frees buffer N-1 on the assumption that config N
+ * latches at the very next SOF, so N-1 never gets scanned again.  Nothing
+ * ever confirms that assumption: if the commit loses the race against the
+ * OVL's next-frame prefetch, the next frame is sourced from N-1 for one
+ * more full scan while its fence is already signalled - the producer then
+ * legally repaints the buffer under the scan beam, which is exactly the
+ * tile-sharp stitch the WDMA captures show.
+ *
+ * Measurement (always on, dmesg "relwin"; the cb-side numbers -
+ * line/gce_mid/hot at the callback moment - are already printed by the
+ * frame block below, this adds the SIGNAL side):
+ *  - sig = sampled when the timeline actually advances;
+ *  - sig2eof = distance from the actual signal to the next RDMA0 EOF,
+ *    i.e. how long BEFORE "end of frame output" the fence fires;
+ *  - mid   = the signal fell between RDMA0 SOF and EOF (scan active);
+ *  - cross = the GCE-sampled IN_LINE_CNT taken right after the config
+ *    writes (forge_gate_slot[2]) shows the writes crossed into active
+ *    scan, i.e. the commit missed the blanking window.
+ *
+ * Fix (default ON, live A/B knob "forgereldone:0/1" in dispsys debugfs):
+ * instead of advancing the timeline in the callback, park the release in
+ * a small FIFO and let a worker signal it only after at least one RDMA0
+ * frame-done STRICTLY NEWER than the enqueue - i.e. after the frame that
+ * carries the new config has fully left RDMA0.  Under a punctual latch
+ * this is one frame later than stock; under a lost latch race it is
+ * exactly the released buffer's off-glass edge.  RDMA0_DONE is the right
+ * event for direct-link: RDMA0 is the module feeding DSI, its frame-done
+ * means the last pixel of the scan-out left the pipe, and both the
+ * trigger loop and the config gate are already built on the same event.
+ * If EOFs stop (suspend, path switch) the worker force-drains on a
+ * 100 ms timeout, so producers are never wedged. */
+/*
+ * m5c, 2026-10-06: default back to the stock inline timing. With the
+ * deferral on, Settings scrolling measured 50-51 % janky frames at P50 61 ms;
+ * with forgereldone:0 3.5-5.4 % at P50 22 ms (same script, same boot, A/B
+ * under root, a capture). Every buffer
+ * came back to HWUI a frame late, and with the queue that short the app ran
+ * at roughly one frame in 3.5 vsyncs. The latch race this guards against was
+ * not seen in that boot: relwin cross=0 over ~48k signals. Write
+ * forgereldone:1 to the dispsys debugfs file to get the deferral back if a
+ * torn frame shows up.
+ */
+unsigned int forge_rel_defer;
+
+struct forge_relwin_stat {
+	unsigned int n;
+	unsigned int mid;	/* fell between SOF and EOF */
+	unsigned int cross;	/* config writes crossed into active scan */
+	unsigned long long dt_eof_sum;	/* ns since last RDMA0 EOF */
+	unsigned long long dt_eof_max;
+};
+static struct forge_relwin_stat forge_relwin_sig;
+static unsigned long long forge_sig_open_ns;	/* pending sig, matched to next EOF */
+static unsigned int forge_sig2eof_n;
+static unsigned long long forge_sig2eof_sum, forge_sig2eof_max;
+static unsigned int forge_eof_seq;
+static unsigned int forge_reldef_inline, forge_reldef_full;
+static unsigned int forge_reldef_defn, forge_reldef_w_sum;	/* deferred: count, EOFs waited */
+
+#define FORGE_RELQ_LEN 32
+struct forge_rel_ent {
+	int idx;
+	unsigned int seq;
+	unsigned int layer;
+};
+static struct forge_rel_ent forge_relq[FORGE_RELQ_LEN];
+static unsigned int forge_relq_head, forge_relq_tail;
+static DEFINE_SPINLOCK(forge_relq_lock);
+static DECLARE_WAIT_QUEUE_HEAD(forge_relq_wq);
+static struct task_struct *forge_reldef_task;
+
+static void _forge_rdma0_irq_cb(enum DISP_MODULE_ENUM module, unsigned int reg_val)
+{
+	if (module != DISP_MODULE_RDMA0 || !(reg_val & (1 << 2)))
+		return;
+	forge_eof_seq++;
+	if (forge_sig_open_ns) {
+		unsigned long long dt = sched_clock() - forge_sig_open_ns;
+
+		forge_sig_open_ns = 0;
+		forge_sig2eof_n++;
+		forge_sig2eof_sum += dt;
+		if (dt > forge_sig2eof_max)
+			forge_sig2eof_max = dt;
+	}
+	wake_up_interruptible(&forge_relq_wq);
+}
+
+/* one sample of "where in the frame are we"; roi < 0 means not read */
+static void forge_relwin_sample(struct forge_relwin_stat *st, const char *tag,
+				int idx, int sub, int roi)
+{
+	unsigned long long t = sched_clock();
+	unsigned long long dt_eof = t - rdma_end_time[0];
+	unsigned long long dt_sof = t - rdma_start_time[0];
+	int mid = (rdma_start_irq_cnt[0] != rdma_done_irq_cnt[0]);
+	unsigned int post = 0xffffffff;
+
+	if (forge_gate_slot)
+		cmdqBackupReadSlot(forge_gate_slot, 2, &post);
+
+	st->n++;
+	if (mid)
+		st->mid++;
+	if (post != 0xffffffff && post < (unsigned int)primary_display_get_height())
+		st->cross++;
+	st->dt_eof_sum += dt_eof;
+	if (dt_eof > st->dt_eof_max)
+		st->dt_eof_max = dt_eof;
+
+	if (st->n <= 6)
+		pr_err("forge-relwin: %s#%u idx=%d sub=%d mid=%d roi=%d post=%u dt_sof=%lluus dt_eof=%lluus\n",
+		       tag, st->n, idx, sub, mid, roi, post,
+		       dt_sof / 1000ull, dt_eof / 1000ull);
+	if (st->n % 256 == 0)
+		pr_err("forge-relwin: sig n=%u mid=%u cross=%u eof_avg=%lluus max=%lluus | sig2eof n=%u avg=%lluus max=%lluus | defer=%u inline=%u full=%u\n",
+		       forge_relwin_sig.n, forge_relwin_sig.mid, forge_relwin_sig.cross,
+		       forge_relwin_sig.n ? forge_relwin_sig.dt_eof_sum / forge_relwin_sig.n / 1000ull : 0,
+		       forge_relwin_sig.dt_eof_max / 1000ull,
+		       forge_sig2eof_n,
+		       forge_sig2eof_n ? forge_sig2eof_sum / forge_sig2eof_n / 1000ull : 0,
+		       forge_sig2eof_max / 1000ull,
+		       forge_rel_defer, forge_reldef_inline, forge_reldef_full);
+	if (st->n % 256 == 0 && forge_reldef_defn)
+		pr_err("forge-relwin: deferred n=%u eof_wait_avg_x100=%u\n",
+		       forge_reldef_defn,
+		       forge_reldef_w_sum * 100 / forge_reldef_defn);
+}
+
+/* the actual timeline advance, wherever it ends up happening */
+static void forge_rel_signal(unsigned int layer, int idx)
+{
+	forge_relwin_sample(&forge_relwin_sig, "sig", idx, -1, -1);
+	forge_sig_open_ns = sched_clock();
+	mtkfb_release_fence(primary_session_id, layer, idx);
+}
+
+static int forge_relq_push(unsigned int layer, int idx)
+{
+	unsigned long flags;
+	unsigned int next;
+
+	if (!forge_reldef_task)
+		return 0;
+	spin_lock_irqsave(&forge_relq_lock, flags);
+	next = (forge_relq_tail + 1) % FORGE_RELQ_LEN;
+	if (next == forge_relq_head) {
+		spin_unlock_irqrestore(&forge_relq_lock, flags);
+		forge_reldef_full++;
+		return 0;
+	}
+	forge_relq[forge_relq_tail].layer = layer;
+	forge_relq[forge_relq_tail].idx = idx;
+	forge_relq[forge_relq_tail].seq = forge_eof_seq;
+	forge_relq_tail = next;
+	spin_unlock_irqrestore(&forge_relq_lock, flags);
+	return 1;
+}
+
+static int forge_relq_ripe(void)
+{
+	unsigned long flags;
+	int ripe = 0;
+
+	spin_lock_irqsave(&forge_relq_lock, flags);
+	if (forge_relq_head != forge_relq_tail &&
+	    (int)(forge_eof_seq - forge_relq[forge_relq_head].seq) > 0)
+		ripe = 1;
+	spin_unlock_irqrestore(&forge_relq_lock, flags);
+	return ripe;
+}
+
+static void forge_relq_drain(int force)
+{
+	unsigned long flags;
+
+	for (;;) {
+		struct forge_rel_ent ent;
+
+		spin_lock_irqsave(&forge_relq_lock, flags);
+		if (forge_relq_head == forge_relq_tail ||
+		    (!force &&
+		     (int)(forge_eof_seq - forge_relq[forge_relq_head].seq) <= 0)) {
+			spin_unlock_irqrestore(&forge_relq_lock, flags);
+			break;
+		}
+		ent = forge_relq[forge_relq_head];
+		forge_relq_head = (forge_relq_head + 1) % FORGE_RELQ_LEN;
+		spin_unlock_irqrestore(&forge_relq_lock, flags);
+
+		forge_reldef_defn++;
+		forge_reldef_w_sum += forge_eof_seq - ent.seq;
+		forge_rel_signal(ent.layer, ent.idx);
+	}
+}
+
+static int _forge_reldef_worker_thread(void *data)
+{
+	struct sched_param param = {.sched_priority = 87 }; /* RTPM_PRIO_FB_THREAD */
+
+	sched_setscheduler(current, SCHED_RR, &param);
+	while (!kthread_should_stop()) {
+		long ret = wait_event_interruptible_timeout(forge_relq_wq,
+							    forge_relq_ripe(),
+							    HZ / 10);
+
+		forge_relq_drain(ret == 0);
+	}
+	return 0;
+}
+
 static int _ovl_fence_release_callback(uint32_t userdata)
 {
 	int i = 0;
@@ -4546,7 +4844,83 @@ static int _ovl_fence_release_callback(uint32_t userdata)
 		} else {
 			cmdqBackupReadSlot(pgc->cur_config_fence, i, &fence_idx);
 			cmdqBackupReadSlot(pgc->subtractor_when_free, i, &subtractor);
-			mtkfb_release_fence(primary_session_id, i, fence_idx - subtractor);
+			/* 2026-08-30 (p62 answered: the callback runs,
+			 * idx/sub are sane): is the fence about to be
+			 * released one the hardware is STILL FETCHING?
+			 * Sample the released buffer's mva BEFORE the
+			 * release drops it from the tracking list, the
+			 * address OVL L0 is fetching right now, and the
+			 * RDMA0 output line counter (live scan position,
+			 * proven live by forgetear).  hot = released mva
+			 * still being fetched - direct proof of an early
+			 * release with no timing inference; mid = releases
+			 * that fired mid-scan rather than in blanking. */
+			if (i == 0) {
+				static unsigned int forge_rel_count;
+				static unsigned int forge_rel_hot;
+				static unsigned int forge_rel_line_mid;
+				static unsigned int forge_gce_mid;
+				int rel_idx = fence_idx - subtractor -
+					      (int)forge_rel_extra;
+				unsigned int rel_mva = 0;
+				unsigned int cur_addr, line;
+				unsigned int g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+
+				if (rel_idx > 0)
+					rel_mva = mtkfb_query_buf_mva(
+						primary_session_id, 0,
+						(unsigned int)rel_idx);
+				/* NOTE: L0_ADDR is the just-written NEXT
+				 * address (immediate-apply register), so
+				 * cur==rel_mva only catches re-submissions.
+				 * The unsmeared truth about WHEN this batch
+				 * executed is in the gate slots, sampled by
+				 * the GCE itself: g0/g1 = RDMA0 in/out line
+				 * at gate open, g2/g3 = after all config
+				 * writes.  A g3 in mid-scan means the batch
+				 * wrote L0_ADDR while the panel was being
+				 * fed - an immediate mid-frame buffer
+				 * switch, which IS a stitch on the glass. */
+				cur_addr = (unsigned int)ddp_ovl_get_cur_addr(
+					!_should_config_ovl_input(), 0);
+				line = DISP_REG_GET(DISP_REG_RDMA_OUT_LINE_CNT);
+				if (forge_gate_slot) {
+					cmdqBackupReadSlot(forge_gate_slot, 0, &g0);
+					cmdqBackupReadSlot(forge_gate_slot, 1, &g1);
+					cmdqBackupReadSlot(forge_gate_slot, 2, &g2);
+					cmdqBackupReadSlot(forge_gate_slot, 3, &g3);
+				}
+				if (rel_mva && rel_mva == cur_addr)
+					forge_rel_hot++;
+				if (line > 0 && line < 1280)
+					forge_rel_line_mid++;
+				if (g3 > 0 && g3 < 1280)
+					forge_gce_mid++;
+				forge_rel_count++;
+				if (forge_rel_count <= 8 ||
+				    forge_rel_count % 100 == 0)
+					pr_err("forge-frame: release #%u L0 idx=%d sub=%d line=%u mid=%u gce_mid=%u gate=%u/%u wr=%u/%u rel_mva=0x%x cur=0x%x hot=%u\n",
+					       forge_rel_count, fence_idx,
+					       subtractor, line,
+					       forge_rel_line_mid,
+					       forge_gce_mid, g0, g1, g2, g3,
+					       rel_mva, cur_addr,
+					       forge_rel_hot);
+			}
+			{
+				/* park the release until the next
+				 * RDMA0 frame-done instead of signalling at
+				 * the config latch (fallback: inline, stock
+				 * timing) */
+				int rel = fence_idx - subtractor -
+					  (int)forge_rel_extra;
+
+				if (!forge_rel_defer || !forge_relq_push(i, rel)) {
+					if (forge_rel_defer)
+						forge_reldef_inline++;
+					forge_rel_signal(i, rel);
+				}
+			}
 		}
 		mmprofile_log_ex(ddp_mmp_get_events()->primary_ovl_fence_release, MMPROFILE_FLAG_PULSE,
 			       i, fence_idx - subtractor);
@@ -4995,6 +5369,632 @@ int primary_display_switch_wdma_dump(int on)
 	return 0;
 }
 
+/*
+ * tear-probe (2026-08-27): WDMA shear probe.
+ *
+ * Every layer measured so far says the submitted buffers are single-moment
+ * (CRC probe, fence journal, hwui A/B), the kernel latches the config in
+ * blanking (forgetear), and yet a stitch of two motion moments was seen on
+ * the glass.  The one place nobody has LOOKED at is the pixel stream the
+ * OVL actually emits toward the panel.  WDMA0 can tee exactly that stream
+ * into memory, so this probe captures OVL output frames back to back and
+ * runs the same row-signature shear analysis the userspace forge_hwc probe
+ * runs on the SUBMITTED buffers (same constants, same legitimacy rule):
+ * signature every row, match rows of capture N against capture N-1 at
+ * vertical offsets -160..+160, group matches into runs.  A healthy scroll
+ * capture moves as one block; a frame carrying two motion moments shows
+ * two multi-row runs at two different non-zero offsets ("solid HARD").
+ * Single-row runs are aliasing of repeating list items and are ignored
+ * (lane rule from the 2026-08-27 evening A/B).
+ *
+ * If solid-HARD captures appear here, the stitch is real at the OVL output
+ * and the fault is at or above the OVL; if hundreds of scroll captures
+ * come back clean while the glass still shows the stitch, everything from
+ * OVL up is exonerated and only DSI transmission and the panel remain.
+ *
+ * Each iteration also snapshots OVL0 INTSTA and clears the sticky
+ * abnormal bits (2 = frame underrun, 5-8 = internal RDMA0-3 EOF abnormal,
+ * 9-12 = internal RDMA0-3 FIFO underflow, p88 layout), which correlates
+ * fetch underflows with the capture that saw them.  The first HARD pair
+ * (previous + current capture) is copied into a keep buffer readable from
+ * debugfs "forge_wdma" for exact offline inspection.
+ *
+ * Cost: WDMA writes 3.6MB per frame to DRAM and the CPU reads it back, so
+ * the probe itself loads the memory system.  That bias is acceptable: it
+ * can only make a bandwidth-shaped artifact MORE likely, never hide it.
+ * Driven from debugfs: "forgewdma:SECONDS" (clamped to 1..30), or
+ * "forgewdma:SECONDS:N" to let N extra frames pass between captures
+ * (halves the probe's own readback load; WDMA keeps writing every frame
+ * regardless, and scroll offsets between captures grow by the same
+ * factor, so keep N small or the 160-row search window starts missing).
+ */
+#define FORGE_WDMA_ROWS_MAX 2048
+#define FORGE_WDMA_D 160
+#define FORGE_WDMA_RUNS 5
+
+unsigned char *forge_wdma_hard_buf;	/* first HARD pair: prev then cur */
+unsigned int forge_wdma_hard_bytes;
+unsigned int forge_wdma_hard_w;
+unsigned int forge_wdma_hard_h;
+
+static unsigned long long forge_wdma_sig_a[FORGE_WDMA_ROWS_MAX];
+static unsigned long long forge_wdma_sig_b[FORGE_WDMA_ROWS_MAX];
+static atomic_t forge_wdma_busy = ATOMIC_INIT(0);
+
+/* Zone analysis ported from forge_hwc engine_shear_probe: probe rows
+ * 16..rows-16 step 8, unique-match each against the previous capture,
+ * fold equal offsets into runs.  Returns 1 for a solid HARD capture
+ * (two or more runs of >=2 probe rows at different non-zero offsets). */
+static int forge_wdma_analyze(const unsigned long long *sc,
+			      const unsigned long long *sp,
+			      unsigned int rows, char *map, int maplen,
+			      int *out_motion, int *out_zoned)
+{
+	int run_s[FORGE_WDMA_RUNS], run_e[FORGE_WDMA_RUNS];
+	int run_d[FORGE_WDMA_RUNS];
+	int dset[FORGE_WDMA_RUNS], sset[FORGE_WDMA_RUNS];
+	int nrun = 0, overflow = 0, ndist = 0, nsolid_nz = 0;
+	int off = 0;
+	unsigned int r;
+	int i, j;
+
+	*out_motion = 0;
+	*out_zoned = 0;
+	map[0] = 0;
+
+	for (r = 16; r + 16 < rows; r += 8) {
+		int d, found = 0, dm = 0;
+
+		for (d = -FORGE_WDMA_D; d <= FORGE_WDMA_D; d++) {
+			int rr = (int)r + d;
+
+			if (rr < 0 || rr >= (int)rows)
+				continue;
+			if (sc[r] == sp[rr]) {
+				if (found++)
+					break;	/* ambiguous row */
+				dm = d;
+			}
+		}
+		if (found != 1)
+			continue;
+		if (nrun && run_d[nrun - 1] == dm) {
+			run_e[nrun - 1] = (int)r;
+		} else if (nrun < FORGE_WDMA_RUNS) {
+			run_s[nrun] = (int)r;
+			run_e[nrun] = (int)r;
+			run_d[nrun] = dm;
+			nrun++;
+		} else {
+			overflow = 1;
+		}
+	}
+
+	for (i = 0; i < nrun; i++) {
+		int d = run_d[i], seen = 0;
+		int solid = run_e[i] > run_s[i];
+
+		if (d)
+			*out_motion = 1;
+		for (j = 0; j < ndist; j++)
+			if (dset[j] == d) {
+				seen = 1;
+				if (solid)
+					sset[j] = 1;
+			}
+		if (!seen && ndist < FORGE_WDMA_RUNS) {
+			dset[ndist] = d;
+			sset[ndist] = solid;
+			ndist++;
+		}
+	}
+	if (ndist >= 2)
+		*out_zoned = 1;
+	for (i = 0; i < ndist; i++)
+		if (dset[i] && sset[i])
+			nsolid_nz++;
+
+	for (i = 0; i < nrun && off < maplen - 24; i++)
+		off += scnprintf(map + off, maplen - off, " %d-%d=%d",
+				 run_s[i], run_e[i], run_d[i]);
+	if (overflow)
+		scnprintf(map + off, maplen - off, " +");
+
+	return nsolid_nz >= 2;
+}
+
+int forge_wdma_shear_probe(unsigned int seconds, unsigned int nth)
+{
+	unsigned int w = primary_display_get_width();
+	unsigned int h = primary_display_get_height();
+	unsigned int pitch = w * 4;
+	unsigned int size = h * pitch;
+	/* Three buffers, not two: WDMA keeps writing the last configured
+	 * address EVERY frame until the next config latches, so the only
+	 * buffer safe to read is the RETIRED one (configured two
+	 * iterations ago).  The first version read the live buffer and the
+	 * CPU readback raced the writer: cache invalidate takes 1-3ms, the
+	 * writer restarts ~0.5ms after EOF, the CPU then overtakes the
+	 * per-line writer in the first third of the frame - manufacturing
+	 * a two-moment stitch with a seam around rows 150-400 in EVERY
+	 * motion capture (the 2026-08-28 HARD maps show first non-zero
+	 * zones at rows 184/200/304 - exactly that).  Rotation: iteration
+	 * k configs buf[k mod 3], waits for the switch, then reads
+	 * buf[(k+2) mod 3] which nobody writes any more; buf[(k+1) mod 3]
+	 * still holds the previous capture for the HARD pair. */
+	void *va[3] = { NULL, NULL, NULL };
+	unsigned int mva[3] = { 0, 0, 0 };
+	m4u_client_t *client = NULL;
+	/* cmdqRecHandle is a macro for "struct cmdqRecStruct *", not a typedef,
+	 * so a combined declaration would make only the first name a pointer
+	 * and leave the second one a struct by value. One per line. */
+	cmdqRecHandle cfg = NULL;
+	cmdqRecHandle wait_h = NULL;
+	struct disp_ddp_path_config *pconfig = NULL;
+	unsigned long long *sig_cur = forge_wdma_sig_a;
+	unsigned long long *sig_prev = forge_wdma_sig_b;
+	unsigned long long *sw;
+	unsigned int prev_valid = 0, caps = 0, motion_caps = 0;
+	unsigned int zoned_caps = 0, hard_caps = 0, hard_uflow = 0;
+	unsigned int uflow_caps = 0, intsta_acc = 0, hard_printed = 0;
+	unsigned int iter = 0, r, i, memout_on = 0, leak_bufs = 0;
+	unsigned long t_end;
+	char map[144];
+	int scen = -1;
+	int ret = 0;
+
+	if (seconds < 1)
+		seconds = 1;
+	if (seconds > 30)
+		seconds = 30;
+	/* 2+nth EOF waits must stay under the ~1s cmdq task timeout */
+	if (nth > 30)
+		nth = 30;
+	if (h > FORGE_WDMA_ROWS_MAX || (pitch & 7)) {
+		pr_err("forge-wdma: geometry %ux%u unsupported\n", w, h);
+		return -1;
+	}
+	if (!primary_display_is_alive()) {
+		pr_err("forge-wdma: display slept, refusing\n");
+		return -1;
+	}
+	if (!primary_display_cmdq_enabled()) {
+		pr_err("forge-wdma: cmdq disabled, refusing\n");
+		return -1;
+	}
+	/* A second concurrent run would fight over WDMA0, the shared keep
+	 * buffer AND clear gSkipIdleDetect under the first one. */
+	if (atomic_cmpxchg(&forge_wdma_busy, 0, 1) != 0) {
+		pr_err("forge-wdma: probe already running, refusing\n");
+		return -1;
+	}
+
+#ifdef MTK_DISP_IDLE_LP
+	/* The idle manager flips direct-link to decouple after ~2s without
+	 * an HWC update (idle detect thread + disp_low_power_remove_ovl=1)
+	 * and its dpmgr_modify_path() rewrites the path scenario.  The
+	 * 2026-08-27 first run died exactly there: the switch ran mid-probe,
+	 * the scenario became rdma0_color0_disp, and the final
+	 * dpmgr_path_remove_memout() hit the scenario ASSERT at
+	 * ddp_manager.c:591 (kernel BUG; the CMDQ error dump showed the
+	 * muxes already in decouple layout).  Park idle detection for the
+	 * probe duration and kick the path back to direct-link first. */
+	gSkipIdleDetect = 1;
+	_disp_primary_path_exit_idle(__func__, 1);
+#endif
+	if (_is_decouple_mode(pgc->session_mode) ||
+	    _is_mirror_mode(pgc->session_mode)) {
+		pr_err("forge-wdma: session_mode=%d not direct-link, refusing\n",
+		       pgc->session_mode);
+		ret = -1;
+		goto out;
+	}
+
+	if (!forge_wdma_hard_buf)
+		forge_wdma_hard_buf = vmalloc(2 * size);
+	forge_wdma_hard_bytes = 0;
+	forge_wdma_hard_w = w;
+	forge_wdma_hard_h = h;
+
+	va[0] = vmalloc(size);
+	va[1] = vmalloc(size);
+	va[2] = vmalloc(size);
+	if (!va[0] || !va[1] || !va[2]) {
+		pr_err("forge-wdma: vmalloc %u failed\n", size);
+		goto out;
+	}
+	client = m4u_create_client();
+	if (!client) {
+		pr_err("forge-wdma: m4u client failed\n");
+		goto out;
+	}
+	for (i = 0; i < 3; i++) {
+		ret = m4u_alloc_mva(client, M4U_PORT_DISP_WDMA0,
+				    (unsigned long)va[i], NULL, size,
+				    M4U_PROT_READ | M4U_PROT_WRITE, 0,
+				    (unsigned int *)&mva[i]);
+		if (ret) {
+			pr_err("forge-wdma: mva alloc %u failed\n", i);
+			mva[i] = 0;
+			goto out;
+		}
+	}
+	if (cmdqRecCreate(CMDQ_SCENARIO_PRIMARY_DISP, &cfg) ||
+	    cmdqRecCreate(CMDQ_SCENARIO_DISP_SCREEN_CAPTURE, &wait_h)) {
+		pr_err("forge-wdma: cmdq handle create failed\n");
+		goto out;
+	}
+
+	dpmgr_path_memout_clock(pgc->dpmgr_handle, 1);
+	cmdqRecReset(cfg);
+	_cmdq_insert_wait_frame_done_token_mira(cfg);
+	_primary_path_lock(__func__);
+	scen = dpmgr_get_scenario(pgc->dpmgr_handle);
+	if (pgc->state != DISP_ALIVE ||
+	    pgc->session_mode != DISP_SESSION_DIRECT_LINK_MODE ||
+	    scen != DDP_SCENARIO_PRIMARY_DISP) {
+		pr_err("forge-wdma: path not ready for memout (state=%d mode=%d scenario=%d), aborting\n",
+		       pgc->state, pgc->session_mode, scen);
+		_primary_path_unlock(__func__);
+		ret = -1;
+		goto out;
+	}
+	ret = dpmgr_path_add_memout(pgc->dpmgr_handle, ENGINE_OVL0, cfg);
+	_primary_path_unlock(__func__);
+	if (ret) {
+		pr_err("forge-wdma: add_memout failed (%d), aborting\n", ret);
+		goto out;
+	}
+	memout_on = 1;
+
+	pr_err("forge-wdma: start %us %ux%u pitch=%u nth=%u\n",
+	       seconds, w, h, pitch, nth);
+	t_end = jiffies + HZ * seconds;
+
+	while (time_before(jiffies, t_end)) {
+		unsigned int st, cap_uflow;
+		unsigned int bw = iter % 3;		/* WDMA target from now */
+		unsigned int br = (iter + 2) % 3;	/* retired, safe to read */
+		unsigned int bp = (iter + 1) % 3;	/* previous capture, kept */
+
+		m4u_cache_sync(client, M4U_PORT_DISP_WDMA0,
+			       (unsigned long)va[bw], size, mva[bw],
+			       M4U_CACHE_FLUSH_BY_RANGE);
+
+		_primary_path_lock(__func__);
+		scen = dpmgr_get_scenario(pgc->dpmgr_handle);
+		if (pgc->state != DISP_ALIVE ||
+		    pgc->session_mode != DISP_SESSION_DIRECT_LINK_MODE ||
+		    scen != DDP_SCENARIO_PRIMARY_ALL ||
+		    !ddp_is_module_in_scenario(scen, DISP_MODULE_WDMA0)) {
+			pr_err("forge-wdma: path changed under probe (state=%d mode=%d scenario=%d), stopping\n",
+			       pgc->state, pgc->session_mode, scen);
+			_primary_path_unlock(__func__);
+			break;
+		}
+		pconfig = dpmgr_path_get_last_config(pgc->dpmgr_handle);
+		pconfig->wdma_dirty = 1;
+		pconfig->wdma_config.dstAddress = mva[bw];
+		pconfig->wdma_config.srcHeight = h;
+		pconfig->wdma_config.srcWidth = w;
+		pconfig->wdma_config.clipX = 0;
+		pconfig->wdma_config.clipY = 0;
+		pconfig->wdma_config.clipHeight = h;
+		pconfig->wdma_config.clipWidth = w;
+		pconfig->wdma_config.outputFormat = eRGBA8888;
+		pconfig->wdma_config.useSpecifiedAlpha = 1;
+		pconfig->wdma_config.alpha = 0xFF;
+		pconfig->wdma_config.dstPitch = pitch;
+		ret = dpmgr_path_config(pgc->dpmgr_handle, pconfig, cfg);
+		pconfig->wdma_dirty = 0;
+		_primary_path_unlock(__func__);
+		_cmdq_set_config_handle_dirty_mira(cfg);
+		_cmdq_flush_config_handle_mira(cfg, 0);
+
+		/* Reset cfg right after the flush so that EVERY exit path
+		 * below hands the remove-memout block a clean record that
+		 * carries only the frame-done wait. */
+		cmdqRecReset(cfg);
+		_cmdq_insert_wait_frame_done_token_mira(cfg);
+
+		/* The address above latches at the next SOF after the config
+		 * record has consumed the frame-done token, so the EOF seen
+		 * first from here may still belong to the old address.  Wait
+		 * two fresh EOFs after clearing the stale token: the second
+		 * one is guaranteed to close a frame fully written to
+		 * va[bw] (worst case one frame later, still ours) - which
+		 * also means va[br] is retired from that point on. */
+		cmdqRecReset(wait_h);
+		cmdqRecClearEventToken(wait_h, CMDQ_EVENT_DISP_WDMA0_EOF);
+		cmdqRecWait(wait_h, CMDQ_EVENT_DISP_WDMA0_EOF);
+		cmdqRecWait(wait_h, CMDQ_EVENT_DISP_WDMA0_EOF);
+		/* thinning: let nth more frames pass before reading back */
+		for (i = 0; i < nth; i++)
+			cmdqRecWait(wait_h, CMDQ_EVENT_DISP_WDMA0_EOF);
+		ret = cmdqRecFlush(wait_h);
+		if (ret) {
+			pr_err("forge-wdma: WDMA EOF wait failed (%d), path stalled? stopping\n",
+			       ret);
+			break;
+		}
+
+		/* OVL0 INTSTA is a raw CPU register access: only touch it
+		 * while the path is known alive, a suspend that slipped in
+		 * during the EOF wait would turn this into an access to a
+		 * powered-down block and hang the bus. */
+		_primary_path_lock(__func__);
+		if (pgc->state != DISP_ALIVE) {
+			_primary_path_unlock(__func__);
+			pr_err("forge-wdma: display left ALIVE, stopping\n");
+			break;
+		}
+		st = DISP_REG_GET(DISP_REG_OVL_INTSTA);
+		if (st & 0x1fe4)
+			DISP_CPU_REG_SET(DISP_REG_OVL_INTSTA, ~0x1fe4);
+		_primary_path_unlock(__func__);
+		intsta_acc |= st;
+		cap_uflow = (st & 0x1e00) ? 1 : 0;
+		if (cap_uflow)
+			uflow_caps++;
+
+		/* WDMA is on va[bw] now; va[br] was retired by this switch
+		 * and holds the last frame fully written to the OLD address.
+		 * Nobody touches it - read THAT, never the live buffer. */
+		if (iter == 0) {
+			/* nothing captured yet */
+			iter++;
+			cond_resched();
+			continue;
+		}
+
+		m4u_cache_sync(client, M4U_PORT_DISP_WDMA0,
+			       (unsigned long)va[br], size, mva[br],
+			       M4U_CACHE_INVALID_BY_RANGE);
+
+		for (r = 0; r < h; r++) {
+			const unsigned long long *q =
+			    (const unsigned long long *)
+			    ((const char *)va[br] + (size_t)r * pitch);
+			unsigned long long acc = 0;
+
+			for (i = 0; i < pitch / 8; i++)
+				acc ^= q[i];
+			sig_cur[r] = acc;
+		}
+
+		if (prev_valid) {
+			int motion = 0, zoned = 0, hard;
+
+			hard = forge_wdma_analyze(sig_cur, sig_prev, h,
+						  map, sizeof(map),
+						  &motion, &zoned);
+			caps++;
+			if (motion)
+				motion_caps++;
+			if (zoned)
+				zoned_caps++;
+			if (hard) {
+				hard_caps++;
+				if (cap_uflow)
+					hard_uflow++;
+				if (!forge_wdma_hard_bytes &&
+				    forge_wdma_hard_buf) {
+					memcpy(forge_wdma_hard_buf,
+					       va[bp], size);
+					memcpy(forge_wdma_hard_buf + size,
+					       va[br], size);
+					forge_wdma_hard_bytes = 2 * size;
+					pr_err("forge-wdma: HARD pair saved to debugfs forge_wdma (prev+cur, %u bytes each)\n",
+					       size);
+				}
+			}
+			if ((hard && hard_printed++ < 16) ||
+			    (zoned && (caps & 0x1f) == 0))
+				pr_err("forge-wdma: cap=%u%s uflow=%u map%s\n",
+				       caps, hard ? " HARD" : "",
+				       cap_uflow, map);
+		}
+
+		sw = sig_prev;
+		sig_prev = sig_cur;
+		sig_cur = sw;
+		prev_valid = 1;
+		iter++;
+		cond_resched();
+	}
+
+out:
+	if (memout_on) {
+		int removed = 0;
+
+		/* Remove the memout ONLY if the path is still in the exact
+		 * state our add_memout left it in.  Calling
+		 * dpmgr_path_remove_memout() on any other scenario is the
+		 * kernel BUG of 2026-08-27 (scenario ASSERT, ddp_manager.c
+		 * line 591).  cfg is a clean record here: it was reset right
+		 * after its last flush and carries only the frame-done wait. */
+		_primary_path_lock(__func__);
+		scen = dpmgr_get_scenario(pgc->dpmgr_handle);
+		if (pgc->state == DISP_ALIVE &&
+		    scen == DDP_SCENARIO_PRIMARY_ALL &&
+		    ddp_is_module_in_scenario(scen, DISP_MODULE_WDMA0)) {
+			dpmgr_path_remove_memout(pgc->dpmgr_handle, cfg);
+			removed = 1;
+		}
+		_primary_path_unlock(__func__);
+		if (removed) {
+			cmdqRecClearEventToken(cfg, CMDQ_EVENT_DISP_WDMA0_EOF);
+			_cmdq_set_config_handle_dirty_mira(cfg);
+			_cmdq_flush_config_handle_mira(cfg, 1);
+			dpmgr_path_memout_clock(pgc->dpmgr_handle, 0);
+		} else if (scen != DDP_SCENARIO_PRIMARY_ALL) {
+			/* A path switch dismantled the memout for us: its
+			 * dpmgr_modify_path() disconnect already dropped WDMA
+			 * from the muxes and the mutex.  Only the clock
+			 * enable from add_memout is left; balance it (CCF
+			 * refcounts, so a decouple path now owning the
+			 * engine keeps its own reference). */
+			pr_err("forge-wdma: memout already dismantled by a path switch (scenario=%d), balancing wdma clock only\n",
+			       scen);
+			if (pgc->state == DISP_ALIVE &&
+			    ddp_modules_driver[DISP_MODULE_WDMA0] &&
+			    ddp_modules_driver[DISP_MODULE_WDMA0]->power_off)
+				ddp_modules_driver[DISP_MODULE_WDMA0]->power_off(
+					DISP_MODULE_WDMA0, NULL);
+		} else {
+			/* Display died with our memout still attached.  The
+			 * registers are unreachable (power domain off), so
+			 * leave the hardware alone, and keep the capture
+			 * buffers mapped: a resume that rebuilds the
+			 * primary_all path would otherwise scribble WDMA
+			 * frames over freed pages.  REBOOT before trusting
+			 * the display again. */
+			pr_err("forge-wdma: display died with memout attached, buffers left mapped, REBOOT advised\n");
+			leak_bufs = 1;
+		}
+	}
+	if (cfg)
+		cmdqRecDestroy(cfg);
+	if (wait_h)
+		cmdqRecDestroy(wait_h);
+	if (!leak_bufs) {
+		for (i = 0; i < 3; i++)
+			if (mva[i])
+				m4u_dealloc_mva(client, M4U_PORT_DISP_WDMA0,
+						mva[i]);
+		if (client)
+			m4u_destroy_client(client);
+		for (i = 0; i < 3; i++)
+			if (va[i])
+				vfree(va[i]);
+	}
+#ifdef MTK_DISP_IDLE_LP
+	gSkipIdleDetect = 0;
+#endif
+	atomic_set(&forge_wdma_busy, 0);
+
+	pr_err("forge-wdma: caps=%u motion=%u zoned=%u hard=%u hard_uflow=%u uflow_caps=%u intsta_acc=0x%x saved=%u\n",
+	       caps, motion_caps, zoned_caps, hard_caps, hard_uflow,
+	       uflow_caps, intsta_acc, forge_wdma_hard_bytes ? 1 : 0);
+	return ret;
+}
+
+/*
+ * tear-probe light mode (2026-08-28): OVL0 INTSTA underflow
+ * counter WITHOUT the WDMA tee.  The full probe above writes 3.6MB per
+ * frame to DRAM and reads it back with the CPU, so its own bus load
+ * inflates the underflow rate it reports (97 percent of captures in the
+ * first live runs, including still frames).  To separate cause from
+ * effect this mode only samples and clears the sticky abnormal INTSTA
+ * bits at roughly 250Hz, a negligible load: run it over a plain scroll
+ * and over a static screen to learn the underflow baseline without the
+ * probe, then compare with uflow_caps of the full probe under the same
+ * scroll.  Idle detection is parked for the run so a static screen
+ * keeps the direct-link path scanning (otherwise the DC switch removes
+ * the OVL from the path and there is nothing to measure).  Sampling
+ * and clearing use the exact mask and layout of the full probe (0x1fe4,
+ * bit 2 frame underrun, 5-8 internal RDMA0-3 EOF abnormal, 9-12
+ * internal RDMA0-3 FIFO underflow), so the numbers are comparable.
+ * Sticky bits sampled at ~4x frame rate: one hit means at least one
+ * event since the previous sample, so per-second hit counts read as
+ * "frames with underflow" to within the oversampling.
+ * Driven from debugfs: "forgeuflow:SECONDS" (clamped to 1..60).
+ */
+int forge_uflow_probe(unsigned int seconds)
+{
+	unsigned int smp = 0, hit_fifo = 0, hit_eof = 0, hit_run = 0;
+	unsigned int sec_smp = 0, sec_fifo = 0, sec_eof = 0, sec_run = 0;
+	unsigned int bit_cnt[4] = { 0, 0, 0, 0 };
+	unsigned int acc = 0, sec = 0;
+	unsigned long t_end, t_sec;
+	int ret = 0;
+
+	if (seconds < 1)
+		seconds = 1;
+	if (seconds > 60)
+		seconds = 60;
+	if (!primary_display_is_alive()) {
+		pr_err("forge-uflow: display slept, refusing\n");
+		return -1;
+	}
+	if (atomic_cmpxchg(&forge_wdma_busy, 0, 1) != 0) {
+		pr_err("forge-uflow: another forge probe running, refusing\n");
+		return -1;
+	}
+#ifdef MTK_DISP_IDLE_LP
+	gSkipIdleDetect = 1;
+	_disp_primary_path_exit_idle(__func__, 1);
+#endif
+	if (_is_decouple_mode(pgc->session_mode) ||
+	    _is_mirror_mode(pgc->session_mode)) {
+		pr_err("forge-uflow: session_mode=%d not direct-link, refusing\n",
+		       pgc->session_mode);
+		ret = -1;
+		goto out;
+	}
+
+	pr_err("forge-uflow: start %us (INTSTA only, no WDMA tee)\n", seconds);
+	t_end = jiffies + HZ * seconds;
+	t_sec = jiffies + HZ;
+
+	while (time_before(jiffies, t_end)) {
+		unsigned int st, b;
+
+		_primary_path_lock(__func__);
+		if (pgc->state != DISP_ALIVE ||
+		    pgc->session_mode != DISP_SESSION_DIRECT_LINK_MODE) {
+			pr_err("forge-uflow: path changed (state=%d mode=%d), stopping\n",
+			       pgc->state, pgc->session_mode);
+			_primary_path_unlock(__func__);
+			break;
+		}
+		st = DISP_REG_GET(DISP_REG_OVL_INTSTA);
+		if (st & 0x1fe4)
+			DISP_CPU_REG_SET(DISP_REG_OVL_INTSTA, ~0x1fe4);
+		_primary_path_unlock(__func__);
+
+		acc |= st;
+		smp++;
+		sec_smp++;
+		if (st & 0x4) {
+			hit_run++;
+			sec_run++;
+		}
+		if (st & 0x1e0) {
+			hit_eof++;
+			sec_eof++;
+		}
+		if (st & 0x1e00) {
+			hit_fifo++;
+			sec_fifo++;
+			for (b = 0; b < 4; b++)
+				if (st & (1u << (9 + b)))
+					bit_cnt[b]++;
+		}
+		if (time_after_eq(jiffies, t_sec)) {
+			sec++;
+			pr_err("forge-uflow: sec=%u smp=%u fifo=%u eofab=%u underrun=%u\n",
+			       sec, sec_smp, sec_fifo, sec_eof, sec_run);
+			sec_smp = 0;
+			sec_fifo = 0;
+			sec_eof = 0;
+			sec_run = 0;
+			t_sec += HZ;
+		}
+		usleep_range(3000, 5000);
+	}
+
+out:
+#ifdef MTK_DISP_IDLE_LP
+	gSkipIdleDetect = 0;
+#endif
+	atomic_set(&forge_wdma_busy, 0);
+	pr_err("forge-uflow: done smp=%u fifo=%u eofab=%u underrun=%u acc=0x%x rdma_fifo_0123=%u/%u/%u/%u\n",
+	       smp, hit_fifo, hit_eof, hit_run, acc,
+	       bit_cnt[0], bit_cnt[1], bit_cnt[2], bit_cnt[3]);
+	return ret;
+}
+
 #define xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 int primary_display_set_frame_buffer_address(unsigned long va, unsigned long mva)
@@ -5092,8 +6092,13 @@ int primary_display_init(char *lcm_name, unsigned int lcm_fps, int is_lcm_inited
 
 	pr_warn("[DISP]primary_display_init begin\n");
 
+/* step ladder, see mtkfb.c */
+#define FKS(v) do { extern void forge_kmark_ptr(int, unsigned long); \
+		forge_kmark_ptr(126, (v)); } while (0)
+	FKS(0x20);
 	dprec_init();
 	dpmgr_init();
+	FKS(0x21);
 
 
 #ifndef MTK_FB_CMDQ_DISABLE
@@ -5123,8 +6128,14 @@ int primary_display_init(char *lcm_name, unsigned int lcm_fps, int is_lcm_inited
 	mutex_init(&(pgc->switch_dst_lock));
 #endif
 	_primary_path_lock(__func__);
+	FKS(0x22);
 
 	pgc->plcm = disp_lcm_probe(lcm_name, LCM_INTERFACE_NOTDEFINED, is_lcm_inited);
+	FKS(0x23);
+	{
+		extern void forge_kmark_ptr(int, unsigned long);
+		forge_kmark_ptr(76, (unsigned long)pgc->plcm);
+	}
 
 	if (pgc->plcm == NULL) {
 		DISPERR("disp_lcm_probe returns null\n");
@@ -5181,9 +6192,11 @@ int primary_display_init(char *lcm_name, unsigned int lcm_fps, int is_lcm_inited
 #else
 	primary_display_use_cmdq = CMDQ_DISABLE;
 #endif
+	FKS(0x24);
 
 	/* debug for bus hang issue (need to remove) */
 	ddp_dump_analysis(DISP_MODULE_CONFIG);
+	FKS(0x25);
 	if (primary_display_mode == DIRECT_LINK_MODE) {
 		__build_path_direct_link();
 		pgc->session_mode = DISP_SESSION_DIRECT_LINK_MODE;
@@ -5235,13 +6248,17 @@ int primary_display_init(char *lcm_name, unsigned int lcm_fps, int is_lcm_inited
 	dpmgr_path_reset(pgc->dpmgr_handle, CMDQ_DISABLE);
 #endif
 
+	FKS(0x26);
 	if (primary_display_use_cmdq == CMDQ_ENABLE) {
 		_cmdq_build_trigger_loop();
+		FKS(0x27);
 		_cmdq_start_trigger_loop();
+		FKS(0x28);
 		_cmdq_reset_config_handle();
 		_cmdq_insert_wait_frame_done_token();
 	}
 
+	FKS(0x29);
 
 	data_config = dpmgr_path_get_last_config(pgc->dpmgr_handle);
 
@@ -5374,6 +6391,17 @@ int primary_display_init(char *lcm_name, unsigned int lcm_fps, int is_lcm_inited
 
 	primary_path_aal_task = kthread_create(_disp_primary_path_check_trigger, NULL, "display_check_aal");
 	wake_up_process(primary_path_aal_task);
+
+	/* layer release fences signal at RDMA0 frame-done (see
+	 * the block above _ovl_fence_release_callback); without the worker
+	 * the queue is never used and releases stay inline */
+	disp_register_module_irq_callback(DISP_MODULE_RDMA0, _forge_rdma0_irq_cb);
+	forge_reldef_task = kthread_run(_forge_reldef_worker_thread, NULL, "forge_reldef");
+	if (IS_ERR(forge_reldef_task)) {
+		pr_err("forge-reldef: worker create failed, releases stay inline\n");
+		forge_reldef_task = NULL;
+		forge_rel_defer = 0;
+	}
 #if 0 /* Zaikuo: disable it when HWC not enable to reduce error log */
 	fence_release_worker_task =
 	    kthread_create(_fence_release_worker_thread, NULL, "fence_worker");
@@ -5468,6 +6496,7 @@ int primary_display_init(char *lcm_name, unsigned int lcm_fps, int is_lcm_inited
 	    (mmdvfs_get_mmdvfs_profile() == MMDVFS_PROFILE_D2_M_PLUS))
 		/* register_mmclk_switch_cb(primary_display_switch_mmsys_clk, _switch_mmsys_clk); */
 done:
+	FKS(0x2F);
 
 	/* disable OVL TF in video mode, cause cmdq/sodi log is not ready, avoid too much TF issue */
 	{
@@ -7781,6 +8810,119 @@ int primary_display_is_ovl1to2_handle(cmdqRecHandle *handle)
 		return 1;
 	else
 		return 0;
+}
+
+/*
+ * put the DDP crossbar into the scenario this handle was built
+ * for, through the driver rather than by hand.
+ *
+ * The path is created at init but connected only from the resume paths, so
+ * at boot the mux registers keep whatever the bootloader left: OVL0 feeding
+ * WDMA0 and the DSI fed from UFOE, a block this chip does not have. The
+ * overlay is then configured perfectly and its pixels go to memory, while
+ * the panel keeps scanning the bootloader's last frame. Writing the mux
+ * registers directly does not survive — the driver rewrites them — so ask
+ * the path manager to do it, which also updates the mutex to match.
+ */
+/*
+ * what the driver believes the path is, so it can be compared
+ * against what the mux registers actually say. A driver in DIRECT_LINK
+ * against hardware wired for decouple sends the overlay's pixels to
+ * memory while the panel scans something else entirely.
+ */
+/*
+ * release every outstanding fence of a primary layer, once.
+ *
+ * The driver releases layer fences as cur_fence minus one, so the frame
+ * currently on the panel stays held until the next one is configured.
+ * The vendor HWC will not configure the next one until an overlay comes
+ * back, and the overlay comes back with that very fence — so once the
+ * pipeline pauses, neither side can move. This breaks the tie by hand to
+ * test whether that is really the loop we are stuck in.
+ */
+void forge_release_layer(unsigned int layer)
+{
+	if (layer >= PRIMARY_DISPLAY_SESSION_LAYER_COUNT) {
+		pr_err("forge-rel: bad layer %u\n", layer);
+		return;
+	}
+	pr_err("forge-rel: releasing all fences of layer %u\n", layer);
+	mtkfb_release_layer_fence(primary_session_id, layer);
+}
+
+/* tear-probe dump - called from dispsys "forgedump", process context */
+void forge_dump_cmdq_gate(void)
+{
+	uint32_t v0 = 0xffffffff, v1 = 0xffffffff, hb = 0xffffffff;
+
+	pr_err("forge-cmdq: hwid rdma0_eof=%d stream0=%d rdma0_sof=%d gate_arm=%u trig_handle=%p\n",
+	       cmdq_core_get_event_value(CMDQ_EVENT_DISP_RDMA0_EOF),
+	       cmdq_core_get_event_value(CMDQ_EVENT_MUTEX0_STREAM_EOF),
+	       cmdq_core_get_event_value(CMDQ_EVENT_DISP_RDMA0_SOF),
+	       forge_gate_arm, pgc->cmdq_handle_trigger);
+	if (forge_gate_slot) {
+		uint32_t g_in = 0xffffffff, g_out = 0xffffffff;
+		uint32_t p_in = 0xffffffff, p_out = 0xffffffff;
+
+		cmdqBackupReadSlot(forge_gate_slot, 0, &g_in);
+		cmdqBackupReadSlot(forge_gate_slot, 1, &g_out);
+		cmdqBackupReadSlot(forge_gate_slot, 2, &p_in);
+		cmdqBackupReadSlot(forge_gate_slot, 3, &p_out);
+		v0 = g_in;
+		v1 = p_in;
+		/* in/out line counters sampled BY THE GCE at gate-open and
+		 * after the config writes.  Interpret only together with the
+		 * CPU-sampled live values below (register semantics!). */
+		pr_err("forge-cmdq: gate in/out=%u/%u post in/out=%u/%u height=%d\n",
+		       g_in, g_out, p_in, p_out, primary_display_get_height());
+	}
+	{
+		/* live semantics probe: the same counters read by the CPU at
+		 * RANDOM scan phases.  A live position counter must scatter
+		 * and climb between samples; a value pinned at one number
+		 * (e.g. == height) means the register does NOT track the
+		 * current line and the slot values above prove nothing. */
+		int fs;
+
+		for (fs = 0; fs < 5; fs++) {
+			/* roi_y = current OVL output line (ADDCON_DBG bits
+			 * 16..28); dbg7 bits: VSA/VBP/VACT/VFP period flags
+			 * of the DSI video engine (DSI0 base + 0x164) */
+			pr_err("forge-cmdq: live in_p=%u in_l=%u out_p=%u out_l=%u roi_y=%u dbg7=0x%x\n",
+			       DISP_REG_GET(DISP_REG_RDMA_IN_P_CNT),
+			       DISP_REG_GET(DISP_REG_RDMA_IN_LINE_CNT),
+			       DISP_REG_GET(DISP_REG_RDMA_OUT_P_CNT),
+			       DISP_REG_GET(DISP_REG_RDMA_OUT_LINE_CNT),
+			       (unsigned int)DISP_REG_GET_FIELD(ADDCON_DBG_FLD_ROI_Y,
+								DISP_REG_OVL_ADDCON_DBG),
+			       (DISP_REG_GET(DISPSYS_DSI0_BASE + 0x164) >> 12) & 0xf);
+			usleep_range(2300, 2700);
+		}
+	}
+	if (forge_loop_slot) {
+		cmdqBackupWriteSlot(forge_loop_slot, 0, 0xdeadbeef);
+		msleep(100);
+		cmdqBackupReadSlot(forge_loop_slot, 0, &hb);
+	}
+	pr_err("forge-cmdq: trigger-loop heartbeat=%s (0x%x)\n",
+	       !forge_loop_slot ? "no-slot" : (hb == 0xdeadbeef ? "DEAD-or-STUCK" : "alive"), hb);
+}
+
+void forge_report_mode(void)
+{
+	pr_err("forge-path: driver session_mode=%d pgc->mode=%d handle=%p ovl2mem=%p\n",
+	       pgc->session_mode, pgc->mode, pgc->dpmgr_handle, pgc->ovl2mem_path_handle);
+}
+
+void forge_reconnect_primary(void)
+{
+	if (!pgc->dpmgr_handle) {
+		pr_err("forge-path: no primary handle\n");
+		return;
+	}
+	pr_err("forge-path: reconnecting primary path\n");
+	dpmgr_path_connect(pgc->dpmgr_handle, CMDQ_DISABLE);
+	dpmgr_path_start(pgc->dpmgr_handle, CMDQ_DISABLE);
 }
 
 int primary_display_diagnose(void)

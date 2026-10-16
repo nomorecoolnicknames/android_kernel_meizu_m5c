@@ -14,7 +14,14 @@
 /*
  * This is for bring up and test only.
  */
-#include "mmdvfs_internal.h"
+/* m5c: include mmdvfs_mgr.h directly instead of mmdvfs_internal.h -
+ * internal.h redefines MMDVFSMSG/MMDVFSERR after mgr.h has defined them
+ * (fatal under -Werror), and its internal_* prototypes are only consumed by
+ * the v3/util files that are not built for mt6735m. workqueue/plist are
+ * needed for struct delayed_work / plist_node inside mmdvfs_mgr.h. */
+#include <linux/workqueue.h>
+#include <linux/plist.h>
+#include "mmdvfs_mgr.h"
 
 #define MMDVFS_BRINGUP_MSG(func_name) MMDVFSMSG("%s for bringup.\n", func_name)
 
@@ -120,7 +127,7 @@ void mmdvfs_debug_set_mmdvfs_clks_enabled(int clk_enable_request)
 	MMDVFS_BRINGUP_MSG(__func__);
 }
 void mmdvfs_internal_notify_vcore_calibration(
-	struct mmdvfs_prepare_action_event *event)
+	struct mmdvfs_prepare_event *event)
 {
 	MMDVFS_BRINGUP_MSG(__func__);
 }

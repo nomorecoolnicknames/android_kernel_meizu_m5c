@@ -355,6 +355,7 @@ static int md_cd_start(struct ccci_modem *md)
 	struct ccci_smem_region *region;
 	int i;
 	long long *llptr;
+	char img_err_str[IMG_ERR_STR_LEN];
 
 	if (md->per_md_data.config.setting & MD_SETTING_FIRST_BOOT) {
 		md_cd_io_remap_md_side_register(md);
@@ -393,19 +394,45 @@ static int md_cd_start(struct ccci_modem *md)
 
 	CCCI_BOOTUP_LOG(md->index, TAG, "CLDMA modem is starting\n");
 	/* 1. load modem image */
-
-	CCCI_BOOTUP_LOG(md->index, TAG,
-		"CLDMA modem image ready, bypass load\n");
-	ret = ccci_get_md_check_hdr_inf(md->index,
-		&md->per_md_data.img_info[IMG_MD],
-		md->per_md_data.img_post_fix);
-	if (ret < 0) {
+	/*
+	 * On this platform LK is expected to load the MD image and pass
+	 * "ccci,modem_info" via the DT chosen node. When that did not happen
+	 * (LK Load MD Disabled -> modem_run_env_ready()==0), the reserved MD
+	 * DRAM is empty and the modem cannot boot. In that case load the
+	 * image here in-kernel via request_firmware(), mirroring the legacy
+	 * (3.18 modem_cldma) behaviour. When LK did load it, keep the
+	 * bypass-load path unchanged.
+	 */
+	if (!modem_run_env_ready(md->index)) {
 		CCCI_BOOTUP_LOG(md->index, TAG,
-			"partition read fail(%d)\n", ret);
-		/* goto out; */
-	} else
+			"MD env not ready, load image in kernel\n");
+		ccci_clear_md_region_protection(md);
+		ret = ccci_load_firmware(md->index,
+			&md->per_md_data.img_info[IMG_MD],
+			img_err_str, md->per_md_data.img_post_fix,
+			&md->plat_dev->dev);
+		if (ret < 0) {
+			CCCI_BOOTUP_LOG(md->index, TAG,
+				"load firmware fail, %s\n", img_err_str);
+			goto out;
+		}
+		/* ccci_load_firmware returns the MD image size on success */
+		ret = 0;
+		md->per_md_data.config.setting &= ~MD_SETTING_RELOAD;
+	} else {
 		CCCI_BOOTUP_LOG(md->index, TAG,
-			"partition read success\n");
+			"CLDMA modem image ready, bypass load\n");
+		ret = ccci_get_md_check_hdr_inf(md->index,
+			&md->per_md_data.img_info[IMG_MD],
+			md->per_md_data.img_post_fix);
+		if (ret < 0) {
+			CCCI_BOOTUP_LOG(md->index, TAG,
+				"partition read fail(%d)\n", ret);
+			/* goto out; */
+		} else
+			CCCI_BOOTUP_LOG(md->index, TAG,
+				"partition read success\n");
+	}
 
 #ifdef FEATURE_BSI_BPI_SRAM_CFG
 	ccci_set_bsi_bpi_SRAM_cfg(md, 1, MD_FLIGHT_MODE_NONE);

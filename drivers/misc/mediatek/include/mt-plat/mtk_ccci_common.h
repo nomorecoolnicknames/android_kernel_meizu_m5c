@@ -636,6 +636,14 @@ int ccci_get_md_check_hdr_inf(int md_id, void *img_inf, char post_fix[]);
 int get_md_img_raw_size(int md_id);
 void clear_meta_1st_boot_arg(int md_id);
 
+/*
+ * Trigger modem boot the same way a write to /sys/kernel/ccci/boot does.
+ * Used by the legacy BOOT-class node /sys/class/BOOT/BOOT/boot/md so the
+ * stock userspace (ccci_mdinit) can start the modem. Returns 0 on success.
+ */
+int ccci_trigger_md_boot(int md_id);
+int ccci_get_boot_status(char *buf, int size);
+
 /* CCCI dump */
 #define CCCI_DUMP_TIME_FLAG		(1<<0)
 #define CCCI_DUMP_CLR_BUF_FLAG	(1<<1)

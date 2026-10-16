@@ -13,6 +13,7 @@
 */
 
 #include <linux/cpuidle.h>
+#include <linux/moduleparam.h>
 #include <linux/cpu_pm.h>
 #include <linux/psci.h>
 #include <linux/of_address.h>
@@ -22,7 +23,9 @@
 #include <asm/cacheflush.h>
 #include <asm/irqflags.h>
 #include <asm/neon.h>
-#include <asm/psci.h>
+#ifndef CONFIG_ARM64
+#include <asm/psci.h>	/* arm32 only; arm64 uses linux/psci.h above */
+#endif
 #include <asm/suspend.h>
 #include <asm/cpuidle.h>
 
@@ -849,11 +852,21 @@ static int mt_cpu_dormant_abort(unsigned long index)
 	return 0;
 }
 #if defined(CONFIG_MACH_MT6735M)
+/*
+ * m5c: PSCI power_state for the SPM sleep/idle entry. The BSP value
+ * is 0x01010005 (cluster power-down, StateID 5). Stock 3.18 on the m5c goes
+ * through cpu_suspend(2) and the DT state cluster-sleep-0,
+ * arm,psci-suspend-param = <0x1010000> (StateID 0), into the same stock ATF.
+ * Writable for sleep tests; the default keeps the BSP value.
+ */
+static uint forge_psci_pps = 0x01010005;
+core_param(forge_psci_pps, forge_psci_pps, uint, 0644);
+
 int mt_cpu_dormant_psci(unsigned long flags)
 {
 	int ret = 1;
 	int cpuid, clusterid;
-	u32 pps = 0x01010005;
+	u32 pps = forge_psci_pps;
 
 	read_id(&cpuid, &clusterid);
 
@@ -1145,6 +1158,42 @@ static int mt_dormant_dts_map(void)
 	return 0;
 }
 
+/*
+ * m5c: the stock ATF (tee1 v1.0 88feacb, Nov 2017) writes CPU
+ * footprints (0xa7f0xxxx: 0x301 right before the suspend WFI, 0x402/0x403
+ * on warm boot, 0xe00 in its FIQ handler) to the address the kernel
+ * registers with MTK_SIP_KERNEL_MSG (0, 2, pa). Its MMU maps only one DRAM
+ * page for that, 0x43f00000 (mmap_add_region(0x43f00000, 0x1000, MT_RW|MT_NS)
+ * at BL31 0x43001b60) - the stock ram console. The m5c ram console lives
+ * at 0x5f000000 (bring-up layout), so ATF's first footprint write in
+ * CPU_SUSPEND took an EL3 translation fault: CPU0 hung in ATF's unhandled
+ * exception path (LAST PC 0x430097c4/cc, coverage journal c26) and SPM
+ * suspend never got further. Register a slot inside the mapped page
+ * instead, and print what ATF left there on the previous boot.
+ */
+#define FORGE_ATF_FP_PAGE	0x43f00000UL
+#define FORGE_ATF_FP_SLOT	(FORGE_ATF_FP_PAGE + 0xf00)
+
+static unsigned long forge_atf_footprint_pa(unsigned long pa)
+{
+	u64 *fp;
+	int i;
+
+	if (pa >= FORGE_ATF_FP_PAGE && pa + 4 * sizeof(u64) <= FORGE_ATF_FP_PAGE + 0x1000)
+		return pa;
+
+	fp = phys_to_virt(FORGE_ATF_FP_SLOT);
+	__flush_dcache_area(fp, 4 * sizeof(u64));
+	pr_warn("[forge] ATF footprints of the last boot @0x%lx: %llx %llx %llx %llx\n",
+		FORGE_ATF_FP_SLOT, fp[0], fp[1], fp[2], fp[3]);
+	for (i = 0; i < 4; i++)
+		fp[i] = 0;
+	__flush_dcache_area(fp, 4 * sizeof(u64));
+	pr_warn("[forge] ATF footprint slot 0x%lx (ram console pa 0x%lx is outside ATF's map)\n",
+		FORGE_ATF_FP_SLOT, pa);
+	return FORGE_ATF_FP_SLOT;
+}
+
 int mt_cpu_dormant_init(void)
 {
 	int cpuid, clusterid;
@@ -1171,7 +1220,7 @@ int mt_cpu_dormant_init(void)
 
 #if !(defined(CONFIG_MACH_MT6580) || defined(CONFIG_ARCH_MT6570))
 #if defined(CONFIG_ARM_PSCI) || defined(CONFIG_MTK_PSCI)
-	kernel_smc_msg(0, 2, (long) sleep_aee_rec_cpu_dormant_pa);
+	kernel_smc_msg(0, 2, forge_atf_footprint_pa((unsigned long)sleep_aee_rec_cpu_dormant_pa));
 #endif
 #endif
 

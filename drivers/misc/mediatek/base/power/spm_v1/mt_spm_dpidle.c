@@ -648,7 +648,12 @@ wake_reason_t spm_go_to_dpidle(u32 spm_flags, u32 spm_data, u32 dump_log)
 	}
 #endif
 
-	__spm_reset_and_init_pcm(pcmdesc);
+	if (__spm_reset_and_init_pcm(pcmdesc)) {
+		/* the running PCM kept its code: nothing below was touched */
+		request_uart_to_wakeup();
+		wr = WR_UNKNOWN;
+		goto RESTORE_IRQ;
+	}
 
 	__spm_kick_im_to_fetch(pcmdesc);
 
@@ -662,7 +667,14 @@ wake_reason_t spm_go_to_dpidle(u32 spm_flags, u32 spm_data, u32 dump_log)
 
 	spm_dpidle_pre_process();
 
-	__spm_kick_pcm_to_run(pwrctrl);
+	if (__spm_kick_pcm_to_run(pwrctrl)) {
+		/* PCM loaded but never kicked: undo the entry steps, no WFI */
+		spm_dpidle_post_process();
+		__spm_clean_after_wakeup();
+		request_uart_to_wakeup();
+		wr = WR_UNKNOWN;
+		goto RESTORE_IRQ;
+	}
 
 #if SPM_AEE_RR_REC
 	aee_rr_rec_deepidle_val(aee_rr_curr_deepidle_val() | (1 << SPM_DEEPIDLE_ENTER_WFI));
@@ -780,7 +792,10 @@ wake_reason_t spm_go_to_sleep_dpidle(u32 spm_flags, u32 spm_data)
 	spm_crit2("sleep_deepidle, sec = %u, wakesrc = 0x%x [%u]\n",
 		  sec, pwrctrl->wake_src, is_cpu_pdn(pwrctrl->pcm_flags));
 
-	__spm_reset_and_init_pcm(pcmdesc);
+	if (__spm_reset_and_init_pcm(pcmdesc)) {
+		last_wr = WR_UNKNOWN;
+		goto RESTORE_IRQ;
+	}
 
 	__spm_kick_im_to_fetch(pcmdesc);
 
@@ -797,13 +812,13 @@ wake_reason_t spm_go_to_sleep_dpidle(u32 spm_flags, u32 spm_data)
 
 	__spm_set_wakeup_event(pwrctrl);
 
-	__spm_kick_pcm_to_run(pwrctrl);
+	if (!__spm_kick_pcm_to_run(pwrctrl)) {
+		spm_dpidle_pre_process();
 
-	spm_dpidle_pre_process();
+		spm_trigger_wfi_for_dpidle(pwrctrl);
 
-	spm_trigger_wfi_for_dpidle(pwrctrl);
-
-	spm_dpidle_post_process();
+		spm_dpidle_post_process();
+	}
 
 	__spm_get_wakeup_status(&wakesta);
 

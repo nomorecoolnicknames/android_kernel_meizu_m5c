@@ -612,7 +612,12 @@ void spm_go_to_sodi(u32 spm_flags, u32 spm_data)
 	aee_rr_rec_sodi_val(aee_rr_curr_sodi_val() | (1 << SPM_SODI_ENTER_SPM_FLOW));
 #endif
 
-	__spm_reset_and_init_pcm(pcmdesc);
+	if (__spm_reset_and_init_pcm(pcmdesc)) {
+		/* the running PCM kept its code: nothing below was touched */
+		request_uart_to_wakeup();
+		wr = WR_UNKNOWN;
+		goto RESTORE_IRQ;
+	}
 
 	__spm_kick_im_to_fetch(pcmdesc);
 
@@ -640,7 +645,14 @@ void spm_go_to_sodi(u32 spm_flags, u32 spm_data)
 
 	spm_sodi_pre_process();
 
-	__spm_kick_pcm_to_run(pwrctrl);
+	if (__spm_kick_pcm_to_run(pwrctrl)) {
+		/* PCM loaded but never kicked: undo the entry steps, no WFI */
+		spm_sodi_post_process();
+		__spm_clean_after_wakeup();
+		request_uart_to_wakeup();
+		wr = WR_UNKNOWN;
+		goto RESTORE_IRQ;
+	}
 
 #if SPM_AEE_RR_REC
 	aee_rr_rec_sodi_val(aee_rr_curr_sodi_val() | (1 << SPM_SODI_ENTER_WFI));

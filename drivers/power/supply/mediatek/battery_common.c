@@ -4260,6 +4260,17 @@ int batt_init_cust_data(void)
 	battery_log(BAT_LOG_CRTI, "battery custom init by DTS\n");
 	__batt_init_cust_data_from_dt();
 #endif
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+	/*
+	 * m5c: the stock cells are 4.35 V ones (stock OCV tables start
+	 * at 4327-4378 mV) and the stock kernel charges to 4.36 V (FAN5405
+	 * OREG 0xAE, VSAFE 0x58).  Only for a battery the stock id logic
+	 * recognises; an unknown one keeps 4.2 V.
+	 */
+	batt_cust_data.high_battery_voltage_support = forge_m5c_battery_id() >= 0;
+	battery_log(BAT_LOG_CRTI, "[forge_m5c_battery] high_battery_voltage_support=%d\n",
+		    batt_cust_data.high_battery_voltage_support);
+#endif
 	return 0;
 }
 

@@ -75,6 +75,28 @@ static struct ccci_port md1_ccci_ports[] = {
 	{CCCI_IPC_TX, CCCI_IPC_RX, 1, 1, 0xFF, 0xFF, 0, &ipc_kern_port_ops, 6, "ccci_ipc_6",},
 	{CCCI_IPC_TX, CCCI_IPC_RX, 1, 1, 0xFF, 0xFF, 0, &ipc_kern_port_ops, 7, "ccci_ipc_7",},
 	{CCCI_IPC_TX, CCCI_IPC_RX, 1, 1, 0xFF, 0xFF, 0, &ipc_kern_port_ops, 8, "ccci_ipc_8",},
+/*
+ * m5c: device nodes the stock userspace opens by name. ccci_mdinit
+ * gets as far as "boot modem1" and then dies on open /dev/ccci_sys_rx with
+ * ENOENT, so md_cd_start() is never reached and the modem never starts.
+ * The stock blobs were built against an older ccci ABI that published a
+ * separate node per direction; this tree publishes only the merged ones.
+ *
+ * Both tx and rx use CCCI_DUMMY_CH on purpose. The rx channel decides RX
+ * demultiplexing (proxy_setup_channel_mapping), and the tx channel decides
+ * which port becomes proxy_p->sys_port / ctl_port - so reusing the real
+ * channels here would either steal packets from the working ports or
+ * re-point sys_port away from its sys_port_ops handler. These entries exist
+ * only so the daemon's open() succeeds; they carry no traffic.
+ */
+	{CCCI_DUMMY_CH, CCCI_DUMMY_CH, 0xFF, 0xFF, 0xFF, 0xFF, 0, &char_port_ops, 24, "ccci_sys_rx",},
+	{CCCI_DUMMY_CH, CCCI_DUMMY_CH, 0xFF, 0xFF, 0xFF, 0xFF, 0, &char_port_ops, 25, "ccci_pcm_rx",},
+	{CCCI_DUMMY_CH, CCCI_DUMMY_CH, 0xFF, 0xFF, 0xFF, 0xFF, 0, &char_port_ops, 26, "ccci_pcm_tx",},
+	{CCCI_DUMMY_CH, CCCI_DUMMY_CH, 0xFF, 0xFF, 0xFF, 0xFF, 0, &char_port_ops, 27, "ccci_uem_rx",},
+	{CCCI_DUMMY_CH, CCCI_DUMMY_CH, 0xFF, 0xFF, 0xFF, 0xFF, 0, &char_port_ops, 28, "ccci_uem_tx",},
+	{CCCI_DUMMY_CH, CCCI_DUMMY_CH, 0xFF, 0xFF, 0xFF, 0xFF, 0, &char_port_ops, 29, "ccci_md_log_rx",},
+	{CCCI_DUMMY_CH, CCCI_DUMMY_CH, 0xFF, 0xFF, 0xFF, 0xFF, 0, &char_port_ops, 30, "ccci_md_log_tx",},
+
 /* sys port */
 	{CCCI_SYSTEM_TX, CCCI_SYSTEM_RX, 0, 0, 0xFF, 0xFF, 0, &sys_port_ops, 0xFF, "ccci_sys",},
 	{CCCI_CONTROL_TX, CCCI_CONTROL_RX, 0, 0, 0, 0, 0, &ctl_port_ops, 0xFF, "ccci_ctrl",},

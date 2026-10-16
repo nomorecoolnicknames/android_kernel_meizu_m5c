@@ -155,11 +155,57 @@ static int hal_dma_receive_data(struct _MTK_DMA_INFO_STR_ *p_dma_info,
 #endif
 
 #ifdef CONFIG_OF
+/*
+ * Fallback for legacy/stock DTBs (e.g. Meizu m5c) where BTIF TX/RX DMA
+ * channels are described by dedicated nodes ("mediatek,btif_tx"/
+ * "mediatek,btif_rx") instead of reg[1]/reg[2] of the "mediatek,btif"
+ * node. Without this of_iomap(node, 1/2) returns NULL, dma base stays 0
+ * and hal_btif_dma_hw_init oopses on the first register access.
+ */
+static void hal_dma_set_from_dedicated_node(struct _MTK_DMA_INFO_STR_ *p_dma_info,
+					    const char *compatible)
+{
+	struct device_node *node = NULL;
+	unsigned int irq_info[3] = {0, 0, 0};
+
+	node = of_find_compatible_node(NULL, NULL, compatible);
+	if (!node) {
+		BTIF_ERR_FUNC("no %s node in DTS\n", compatible);
+		return;
+	}
+	p_dma_info->p_irq->irq_id = irq_of_parse_and_map(node, 0);
+	/*fixme, be compitable arch 64bits*/
+	p_dma_info->base = (unsigned long)of_iomap(node, 0);
+	BTIF_INFO_FUNC("%s fallback: irq(%d),register base(0x%lx)\n",
+		compatible, p_dma_info->p_irq->irq_id, p_dma_info->base);
+	/* get the interrupt line behaviour */
+	if (of_property_read_u32_array(node, "interrupts",
+				       irq_info, ARRAY_SIZE(irq_info))) {
+		BTIF_ERR_FUNC("get interrupt flag from %s fail\n", compatible);
+	} else {
+		p_dma_info->p_irq->irq_flags = irq_info[2];
+		BTIF_INFO_FUNC("get interrupt flag(0x%x)\n",
+			p_dma_info->p_irq->irq_flags);
+	}
+	of_node_put(node);
+}
+
 static void hal_dma_set_default_setting(enum _ENUM_DMA_DIR_ dma_dir)
 {
 	struct device_node *node = NULL;
 	unsigned int irq_info[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 	unsigned int phy_base;
+
+	/* already resolved (directly or by fallback): do not re-ioremap */
+	if (dma_dir == DMA_DIR_RX && mtk_btif_rx_dma.base != 0)
+		return;
+	if (dma_dir == DMA_DIR_TX && mtk_btif_tx_dma.base != 0)
+		return;
+
+	if (g_btif[0].private_data == NULL) {
+		BTIF_ERR_FUNC("btif platform device not probed, no DTS info\n");
+		return;
+	}
 
 	if (dma_dir == DMA_DIR_RX) {
 		node = ((struct device *)(g_btif[0].private_data))->of_node;
@@ -216,6 +262,20 @@ static void hal_dma_set_default_setting(enum _ENUM_DMA_DIR_ dma_dir)
 		}
 	}
 
+	/* stock DTB (m5c) has no dma regs in the btif node: use dedicated nodes */
+	if (dma_dir == DMA_DIR_RX && mtk_btif_rx_dma.base == 0) {
+		hal_dma_set_from_dedicated_node(&mtk_btif_rx_dma,
+						"mediatek,btif_rx");
+		if (mtk_btif_rx_dma.base == 0)
+			hal_dma_set_from_dedicated_node(&mtk_btif_rx_dma,
+						"mediatek,AP_DMA_BTIF_RX");
+	} else if (dma_dir == DMA_DIR_TX && mtk_btif_tx_dma.base == 0) {
+		hal_dma_set_from_dedicated_node(&mtk_btif_tx_dma,
+						"mediatek,btif_tx");
+		if (mtk_btif_tx_dma.base == 0)
+			hal_dma_set_from_dedicated_node(&mtk_btif_tx_dma,
+						"mediatek,AP_DMA_BTIF_TX");
+	}
 }
 #endif
 
@@ -402,6 +462,12 @@ int hal_btif_dma_hw_init(struct _MTK_DMA_INFO_STR_ *p_dma_info)
 							    struct _MTK_BTIF_DMA_VFIFO_,
 							    vfifo);
 
+	if (base == 0) {
+		BTIF_ERR_FUNC("DMA base not initialized(dir:%d), missing DTS resource?\n",
+			p_dma_info->dir);
+		return ERR_INVALID_PAR;
+	}
+
 	if (p_dma_info->dir == DMA_DIR_RX) {
 		/*Rx DMA*/
 		/*do hardware reset*/
@@ -487,6 +553,12 @@ int hal_btif_dma_ctrl(struct _MTK_DMA_INFO_STR_ *p_dma_info,
 {
 	unsigned int i_ret = -1;
 	enum _ENUM_DMA_DIR_ dir = p_dma_info->dir;
+
+	if (p_dma_info->base == 0) {
+		BTIF_ERR_FUNC("DMA base not initialized(dir:%d), missing DTS resource?\n",
+			dir);
+		return ERR_INVALID_PAR;
+	}
 
 	if (dir == DMA_DIR_RX)
 		i_ret = btif_rx_dma_ctrl(p_dma_info, ctrl_id);

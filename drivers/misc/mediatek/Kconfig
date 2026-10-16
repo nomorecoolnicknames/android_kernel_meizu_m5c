@@ -239,6 +239,16 @@ config MTK_SENSORS_1_0
 
 source "drivers/misc/mediatek/sensors-1.0/Kconfig"
 
+# Legacy (3.18) hwmsen sensor framework — provides the /dev/hwmsensor
+# ioctl ABI required by the stock m5c userspace HAL (sensors.mt6737m.so).
+# Mutually exclusive with sensors-1.0: legacy chip drivers carry
+# "depends on !MTK_SENSORS_1_0" and the legacy directories are only
+# built when MTK_SENSORS_1_0=n (see drivers/misc/mediatek/Makefile).
+source "drivers/misc/mediatek/hwmon/Kconfig"
+source "drivers/misc/mediatek/accelerometer/Kconfig"
+source "drivers/misc/mediatek/magnetometer/Kconfig"
+source "drivers/misc/mediatek/alsps/Kconfig"
+
 endmenu  # Sensors
 
 menu "Modem & Connectivity related configs"
@@ -251,6 +261,7 @@ source "drivers/misc/mediatek/dual_ccci/Kconfig"
 source "drivers/misc/mediatek/eccci/Kconfig"
 source "drivers/misc/mediatek/conn_md/Kconfig"
 source "drivers/misc/mediatek/btif/Kconfig"
+source "drivers/misc/mediatek/fmradio/Kconfig"
 source "drivers/misc/mediatek/ssw/Kconfig"
 
 endmenu  # CONN

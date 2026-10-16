@@ -15,6 +15,7 @@
  */
 
 #include <linux/compat.h>
+#include <linux/stddef.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 
@@ -129,6 +130,31 @@ struct compat_ion_mm_sf_buf_info {
 	unsigned int info[ION_MM_SF_BUF_INFO_LEN];
 };
 
+/* m5c (camera lane, 2026-09-03): __packed is load-bearing, do not drop.
+ *
+ * compat_u64 is plain u64, which the arm64 compiler aligns to 8.  Without
+ * __packed this single member gives the whole union inside
+ * struct compat_ion_mm_data an 8-byte alignment requirement, so the union
+ * starts at offset 8 - while the 32-bit userspace this struct is supposed to
+ * mirror starts it at offset 4.  The 2016 MTK userspace header still in this
+ * tree (device/meizu/m5c/libion_mtk/include/ion_drv.h:184) has only THREE
+ * union members - config_buffer_param, buf_debug_info_param,
+ * sf_buf_info_param - all of them 4-aligned; neither pool_info_param nor
+ * get_phys_param exists there, so nothing pushes its union past offset 4.
+ *
+ * The 4-byte shift made the kernel read every field of ION_MM_CONFIG_BUFFER
+ * one slot late: handle came out of userspace's module_id (a fixed M4U port
+ * id, hence the constant "can't get handle by id:20" on every buffer and on
+ * every kernel build) and module_id came out of userspace's security, i.e. 0,
+ * hence "ion config buffer fail! port=0".  60-75 failures per camera launch,
+ * ending in SIGSEGV in PreviewCmdQueThread::delay().
+ *
+ * Packing changes no member offset here (phy_addr already sat at 24, which is
+ * 8-aligned); it only drops the struct's alignment requirement, which is the
+ * whole point.  Nothing implements ION_MM_GET_IOVA in this tree anyway
+ * (ion_drv.h notes the enum members were added for compat_ion.c alone), so
+ * this struct has no on-the-wire user to break.
+ */
 struct compat_ion_mm_get_iova_param {
 	union {
 		compat_int_t handle;
@@ -141,13 +167,14 @@ struct compat_ion_mm_get_iova_param {
 	compat_uint_t reserve_iova_end;
 	compat_u64 phy_addr;
 	compat_size_t len;
-};
+} __packed;
 
 struct compat_ion_mm_data {
 	compat_uint_t mm_cmd;
 	union {
 		struct compat_ion_mm_config_buf_param config_buffer_param;
 		struct compat_ion_mm_buf_debug_info  buf_debug_info_param;
+		struct compat_ion_mm_sf_buf_info sf_buf_info_param;
 		struct compat_ion_mm_pool_info  pool_info_param;
 		struct compat_ion_mm_get_iova_param get_phys_param;
 	};
@@ -363,6 +390,41 @@ static int compat_get_ion_mm_buf_debug_info(
 	return err;
 }
 
+static int compat_get_ion_mm_sf_buf_info(
+			struct compat_ion_mm_sf_buf_info __user *data32,
+			struct ion_mm_sf_buf_info __user *data)
+{
+	compat_ulong_t handle;
+	compat_uint_t info;
+
+	int i, err;
+
+	err = get_user(handle, &data32->handle);
+	err |= put_user(handle, &data->handle);
+	for (i = 0; i < ION_MM_SF_BUF_INFO_LEN; i++) {
+		err |= get_user(info, &data32->info[i]);
+		err |= put_user(info, &data->info[i]);
+	}
+
+	return err;
+}
+
+static int compat_put_ion_mm_sf_buf_info(
+			struct compat_ion_mm_sf_buf_info __user *data32,
+			struct ion_mm_sf_buf_info __user *data)
+{
+	compat_uint_t info;
+
+	int i, err = 0;
+
+	for (i = 0; i < ION_MM_SF_BUF_INFO_LEN; i++) {
+		err |= get_user(info, &data->info[i]);
+		err |= put_user(info, &data32->info[i]);
+	}
+
+	return err;
+}
+
 static int compat_get_ion_mm_pool_info(
 			struct compat_ion_mm_pool_info __user *data32,
 			struct ion_mm_pool_info __user *data)
@@ -447,6 +509,19 @@ static int compat_get_ion_mm_data(struct compat_ion_mm_data *data32,
 
 	int err;
 
+	/* The 32-bit contract is NOT the same as the native one: the 2016
+	 * userspace header this struct mirrors starts its union at 4, not 8.
+	 * The camera lane found the kernel side sitting at 8 because
+	 * compat_ion_mm_get_iova_param carried an 8-aligned compat_u64; it is
+	 * __packed now, and these numbers hold the result in place.  Measured
+	 * after that fix: struct 72 bytes, union at 4.
+	 */
+	BUILD_BUG_ON(sizeof(struct compat_ion_mm_data) != 72);
+	BUILD_BUG_ON(offsetof(struct compat_ion_mm_data,
+			      config_buffer_param) != 4);
+	BUILD_BUG_ON(offsetof(struct compat_ion_mm_data,
+			      sf_buf_info_param) != 4);
+
 	err = get_user(mm_cmd, &data32->mm_cmd);
 	err |= put_user(mm_cmd, &data->mm_cmd);
 
@@ -481,6 +556,14 @@ static int compat_get_ion_mm_data(struct compat_ion_mm_data *data32,
 			&data->buf_debug_info_param);
 		break;
 	}
+	case ION_MM_SET_SF_BUF_INFO:
+	case ION_MM_GET_SF_BUF_INFO:
+	{
+		err |= compat_get_ion_mm_sf_buf_info(
+			&data32->sf_buf_info_param,
+			&data->sf_buf_info_param);
+		break;
+	}
 	case ION_MM_ACQ_CACHE_POOL:
 	case ION_MM_QRY_CACHE_POOL:
 	{
@@ -509,6 +592,13 @@ static int compat_put_ion_mm_data(struct compat_ion_mm_data *data32,
 		err |= compat_put_ion_mm_buf_debug_info(
 			&data32->buf_debug_info_param,
 			&data->buf_debug_info_param);
+		break;
+	}
+	case ION_MM_GET_SF_BUF_INFO:
+	{
+		err |= compat_put_ion_mm_sf_buf_info(
+			&data32->sf_buf_info_param,
+			&data->sf_buf_info_param);
 		break;
 	}
 	case ION_MM_GET_IOVA:
@@ -848,6 +938,15 @@ static int compat_put_ion_custom_data(
 long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	long ret;
+
+	/* m5c: the union must start where 32-bit userspace starts it.
+	 * See the note on struct compat_ion_mm_get_iova_param - if this trips,
+	 * something re-introduced an 8-aligned member into the union and every
+	 * ION_MM_* field is again being read one slot late. */
+	BUILD_BUG_ON(offsetof(struct compat_ion_mm_data, config_buffer_param) != 4);
+	BUILD_BUG_ON(offsetof(struct compat_ion_mm_data, buf_debug_info_param) != 4);
+	/* sf_buf_info_param lives on the display lane's branch; its gate is
+	 * added there, with the same expected value of 4. */
 
 	if (!filp->f_op || !filp->f_op->unlocked_ioctl) {
 		IONMSG("compat_ion_ioctl has no f_op or no unlocked_ioctl\n");

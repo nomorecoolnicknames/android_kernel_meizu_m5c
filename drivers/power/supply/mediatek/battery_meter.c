@@ -54,6 +54,12 @@
 #include <mach/mt_battery_meter_table.h>
 #endif
 #include <mach/mt_pmic.h>
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+#include <linux/of_platform.h>
+#include <linux/pinctrl/consumer.h>
+#include <mt-plat/mt_gpio.h>
+#include <mach/mt_battery_meter_table_m5c_stock.h>
+#endif
 
 
 #include <mt-plat/upmu_common.h>
@@ -1227,18 +1233,141 @@ R_PROFILE_STRUCT_P fgauge_get_profile_r_table(unsigned int temperature)
 	}
 }
 #else
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+/*
+ * m5c: which battery is in the phone, the way the stock kernel
+ * decides it (fgauge_get_profile_id @ 0xffffffc0007f6780 in the Flyme
+ * 6.0.2.4G vmlinux): the bat_meter node names two pins, each with a pinctrl
+ * state of its own (stock DTB: batidpin 3, "bat_meter_batid", bias-disable;
+ * idboardpin 120, "bat_meter_board", pull-up).
+ *   batid pin high                  -> 1 VEKEN
+ *   batid low, board pin high       -> 0 ATL
+ *   batid low, board pin low        -> 2 SUNWODA
+ * Any failure (no node, no pinctrl state, a GPIO read error) leaves the id
+ * unknown (-1): the reference MTK profile and 4.2 V charging stay, exactly
+ * as without this option.  Known ids get the stock profile and 4.35 V CV.
+ */
+static int forge_m5c_bat_id = -2;	/* -2 not probed yet, -1 unknown */
+static DEFINE_MUTEX(forge_m5c_bat_id_lock);
+
+static int forge_m5c_read_pin(struct pinctrl *pctl, const char *state, u32 pin)
+{
+	struct pinctrl_state *st = pinctrl_lookup_state(pctl, state);
+	int val;
+
+	if (IS_ERR(st) || pinctrl_select_state(pctl, st)) {
+		pr_err("[forge_m5c_battery] pinctrl state %s missing\n", state);
+		return -1;
+	}
+	udelay(100);
+	val = mt_get_gpio_in(pin | 0x80000000);
+	if (val < 0 || val > 1) {
+		pr_err("[forge_m5c_battery] GPIO%u read %d\n", pin, val);
+		return -1;
+	}
+	return val;
+}
+
+int forge_m5c_battery_id(void)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+	struct pinctrl *pctl;
+	u32 batid_pin, board_pin;
+	int id = -1, batid, board = -1;
+
+	if (READ_ONCE(forge_m5c_bat_id) != -2)
+		return forge_m5c_bat_id;
+	mutex_lock(&forge_m5c_bat_id_lock);
+	if (forge_m5c_bat_id != -2) {
+		mutex_unlock(&forge_m5c_bat_id_lock);
+		return forge_m5c_bat_id;
+	}
+	batid = -1;
+
+	np = of_find_compatible_node(NULL, NULL, "mediatek,bat_meter");
+	if (!np || of_property_read_u32(np, "batidpin", &batid_pin) ||
+	    of_property_read_u32(np, "idboardpin", &board_pin)) {
+		pr_err("[forge_m5c_battery] bat_meter node or id pins missing\n");
+		goto out;
+	}
+	pdev = of_find_device_by_node(np);
+	if (!pdev) {
+		pr_err("[forge_m5c_battery] no bat_meter device\n");
+		goto out;
+	}
+	pctl = pinctrl_get(&pdev->dev);
+	put_device(&pdev->dev);
+	if (IS_ERR(pctl)) {
+		pr_err("[forge_m5c_battery] no pinctrl for bat_meter\n");
+		goto out;
+	}
+	batid = forge_m5c_read_pin(pctl, "bat_meter_batid", batid_pin);
+	if (batid == 0)
+		board = forge_m5c_read_pin(pctl, "bat_meter_board", board_pin);
+	pinctrl_put(pctl);
+	if (batid == 1)
+		id = 1;
+	else if (batid == 0 && board == 1)
+		id = 0;
+	else if (batid == 0 && board == 0)
+		id = 2;
+	pr_info("[forge_m5c_battery] GPIO%u=%d GPIO%u=%d -> battery id %d (%s)\n",
+		batid_pin, batid, board_pin, board, id,
+		id >= 0 ? forge_m5c_stock_battery_name[id] :
+		"unknown: MTK reference profile, 4.2 V");
+out:
+	of_node_put(np);
+	WRITE_ONCE(forge_m5c_bat_id, id);
+	mutex_unlock(&forge_m5c_bat_id_lock);
+	return id;
+}
+EXPORT_SYMBOL(forge_m5c_battery_id);
+
+static int forge_m5c_temp_index(unsigned int temperature)
+{
+	if (temperature == batt_meter_cust_data.temperature_t0)
+		return 0;
+	if (temperature == batt_meter_cust_data.temperature_t1)
+		return 1;
+	if (temperature == batt_meter_cust_data.temperature_t2)
+		return 2;
+	if (temperature == batt_meter_cust_data.temperature_t3)
+		return 3;
+	if (temperature == batt_meter_cust_data.temperature_t)
+		return 4;
+	return -1;
+}
+#endif
+
 int fgauge_get_saddles(void)
 {
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+	if (forge_m5c_battery_id() >= 0)
+		return FORGE_M5C_STOCK_POINTS;
+#endif
 	return sizeof(battery_profile_t2) / sizeof(BATTERY_PROFILE_STRUCT);
 }
 
 int fgauge_get_saddles_r_table(void)
 {
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+	if (forge_m5c_battery_id() >= 0)
+		return FORGE_M5C_STOCK_POINTS;
+#endif
 	return sizeof(r_profile_t2) / sizeof(R_PROFILE_STRUCT);
 }
 
 BATTERY_PROFILE_STRUCT_P fgauge_get_profile(unsigned int temperature)
 {
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+	int id = forge_m5c_battery_id(), t = forge_m5c_temp_index(temperature);
+
+	if (id >= 0 && t == 4)
+		return &forge_m5c_stock_profile_temperature[0];
+	if (id >= 0 && t >= 0)
+		return &forge_m5c_stock_profile[id][t][0];
+#endif
 	if (temperature == batt_meter_cust_data.temperature_t0)
 		return &battery_profile_t0[0];
 
@@ -1261,6 +1390,14 @@ BATTERY_PROFILE_STRUCT_P fgauge_get_profile(unsigned int temperature)
 
 R_PROFILE_STRUCT_P fgauge_get_profile_r_table(unsigned int temperature)
 {
+#ifdef CONFIG_FORGE_M5C_BATTERY_PROFILE
+	int id = forge_m5c_battery_id(), t = forge_m5c_temp_index(temperature);
+
+	if (id >= 0 && t == 4)
+		return &forge_m5c_stock_r_profile_temperature[0];
+	if (id >= 0 && t >= 0)
+		return &forge_m5c_stock_r_profile[id][t][0];
+#endif
 	if (temperature == batt_meter_cust_data.temperature_t0)
 		return &r_profile_t0[0];
 

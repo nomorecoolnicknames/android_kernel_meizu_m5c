@@ -89,11 +89,20 @@ static struct mmdvfs_context_struct * const g_mmdvfs_mgr = &g_mmdvfs_mgr_cntx;
 
 enum mmdvfs_lcd_size_enum mmdvfs_get_lcd_resolution(void)
 {
+#if defined(CONFIG_MTK_FB)
 	if (DISP_GetScreenWidth() * DISP_GetScreenHeight()
 	<= MMDVFS_DISPLAY_SIZE_HD)
 		return MMDVFS_LCD_SIZE_HD;
 
 	return MMDVFS_LCD_SIZE_FHD;
+#else
+	/* Display stack (CONFIG_MTK_FB) is not built in this tree yet.
+	 * m5c panel is 720x1280 (HD class), which is also what stock
+	 * 3.18 resolves here at runtime via DISP_GetScreenWidth/Height.
+	 * Same fallback policy as mmdvfs_mgr_util.c (mt6758/mt6765).
+	 * When MTK_FB is enabled this guard compiles out automatically. */
+	return MMDVFS_LCD_SIZE_HD;
+#endif
 }
 
 static int vdec_ctrl_func_checked(vdec_ctrl_cb func, char *msg);

@@ -12,6 +12,16 @@ config MTK_FLASHLIGHT
 		If you have any questions about this, say Y here, only say N
 		if you know exactly what you are doing.
 
+config CUSTOM_KERNEL_FLASHLIGHT
+	string "CUSTOM_KERNEL_FLASHLIGHT"
+	depends on MTK_FLASHLIGHT
+	help
+	  Kernel space camera flashlight driver list, e.g. "constant_flashlight".
+	  When non-empty, the legacy (3.18-style) kd_camera_flashlight stack
+	  under flashlight/src/$(MTK_PLATFORM) is built instead of the 4.9
+	  flashlight-core; the mt6735-family camera HAL talks to
+	  /dev/kd_camera_flashlight directly.
+
 config MTK_FLASHLIGHT_CP2155
 	tristate "Mediatek flashlight cp2155 gpio driver"
 	depends on MTK_FLASHLIGHT

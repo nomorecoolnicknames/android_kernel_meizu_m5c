@@ -146,16 +146,33 @@ unsigned int __attribute__((weak))
 /*
  * Function and API
  */
-void __spm_reset_and_init_pcm(const struct pcm_desc *pcmdesc)
+/*
+ * the busy-waits below run with IRQs off and the watchdog stopped
+ * (wd_suspend_notify), so an unanswered poll is a hang that only a long
+ * power-key press ends. Bound them; on timeout, report and close the
+ * low-power gate so the idle paths do not retry.
+ */
+#define SPM_POLL_TIMEOUT_US	10000
+
+int __spm_reset_and_init_pcm(const struct pcm_desc *pcmdesc)
 {
 	u32 con1;
 
 #ifdef SPM_VCORE_EN
 	if (spm_read(SPM_PCM_REG1_DATA) == 0x1) {
+		int i = 0;
+
 		/* SPM code swapping (force high voltage) */
 		spm_write(SPM_SLEEP_CPU_WAKEUP_EVENT, 1);
-		while (spm_read(SPM_PCM_REG11_DATA) != 0x55AA55AA)
+		while (spm_read(SPM_PCM_REG11_DATA) != 0x55AA55AA) {
+			if (++i > SPM_POLL_TIMEOUT_US) {
+				spm_write(SPM_SLEEP_CPU_WAKEUP_EVENT, 0);
+				spm_forge_lowpower_trip("vcore dvfs code-swap ack, REG11",
+							spm_read(SPM_PCM_REG11_DATA));
+				return -EBUSY;
+			}
 			udelay(1);
+		}
 		spm_write(SPM_SLEEP_CPU_WAKEUP_EVENT, 0);
 	}
 #endif
@@ -174,6 +191,8 @@ void __spm_reset_and_init_pcm(const struct pcm_desc *pcmdesc)
 		  CON1_SPM_SRAM_ISO_B | CON1_SPM_SRAM_SLP_B |
 		  (pcmdesc->replace ? 0 : CON1_IM_NONRP_EN) |
 		  CON1_MIF_APBEN | CON1_MD32_APB_INTERNAL_EN);
+
+	return 0;
 }
 
 void __spm_kick_im_to_fetch(const struct pcm_desc *pcmdesc)
@@ -302,9 +321,10 @@ void __spm_set_wakeup_event(const struct pwr_ctrl *pwrctrl)
 	spm_write(SPM_SLEEP_ISR_MASK, isr | ISRM_RET_IRQ_AUX);
 }
 
-void __spm_kick_pcm_to_run(const struct pwr_ctrl *pwrctrl)
+int __spm_kick_pcm_to_run(const struct pwr_ctrl *pwrctrl)
 {
 	u32 con0;
+	int i = 0;
 
 	/* init register to match PCM expectation */
 	spm_write(SPM_PCM_MAS_PAUSE_MASK, 0xffffffff);
@@ -323,13 +343,21 @@ void __spm_kick_pcm_to_run(const struct pwr_ctrl *pwrctrl)
 	spm_write(SPM_PCM_PWR_IO_EN, (pwrctrl->r0_ctrl_en ? PCM_PWRIO_EN_R0 : 0) |
 		  (pwrctrl->r7_ctrl_en ? PCM_PWRIO_EN_R7 : 0));
 
-	while ((spm_read(SPM_PCM_FSM_STA) & (0x7 << 7)) != (0x4 << 7))
-		;
+	while ((spm_read(SPM_PCM_FSM_STA) & (0x7 << 7)) != (0x4 << 7)) {
+		if (++i > SPM_POLL_TIMEOUT_US) {
+			spm_forge_lowpower_trip("PCM FSM ready-to-kick, FSM_STA",
+						spm_read(SPM_PCM_FSM_STA));
+			return -EBUSY;
+		}
+		udelay(1);
+	}
 
 	/* kick PCM to run (only toggle PCM_KICK) */
 	con0 = spm_read(SPM_PCM_CON0) & ~(CON0_IM_KICK | CON0_PCM_KICK);
 	spm_write(SPM_PCM_CON0, con0 | CON0_CFG_KEY | CON0_PCM_KICK);
 	spm_write(SPM_PCM_CON0, con0 | CON0_CFG_KEY);
+
+	return 0;
 }
 
 void __spm_get_wakeup_status(struct wake_status *wakesta)

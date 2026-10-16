@@ -162,7 +162,17 @@ static u32 charging_hw_init(void *data)
 #endif
 	battery_log(BAT_LOG_CRTI, "fan5405  charging_hw_init  line=%d\n", __LINE__);
 
-#if defined(HIGH_BATTERY_VOLTAGE_SUPPORT)
+#if defined(CONFIG_FORGE_M5C_BATTERY_PROFILE)
+	/*
+	 * m5c: safety limits by battery, as the stock charging_hw_init
+	 * (0xffffffc0004810c4 in the Flyme 6.0.2.4G vmlinux) writes reg06 =
+	 * 0x58: ISAFE code 5, VSAFE 4.20 + 8 * 0.02 = 4.36 V.  An unknown
+	 * battery keeps 0x70 (VSAFE 4.20 V).  The register only takes the
+	 * first write after a reset; if the bootloader already wrote it, this
+	 * write is ignored and OREG stays clamped to the bootloader's VSAFE.
+	 */
+	fan5405_reg_config_interface(0x06, forge_m5c_battery_id() >= 0 ? 0x58 : 0x70);
+#elif defined(HIGH_BATTERY_VOLTAGE_SUPPORT)
 	fan5405_reg_config_interface(0x06, 0x47); /*ISAFE = 1050mA, VSAFE = 4.34V*/
 #else
 	fan5405_reg_config_interface(0x06, 0x70);
@@ -219,8 +229,29 @@ static u32 charging_set_cv_voltage(void *data)
 	u32 status = STATUS_OK;
 	u16 register_value;
 
+#if defined(CONFIG_FORGE_M5C_BATTERY_PROFILE)
+	{
+		/*
+		 * m5c: the charging algorithm asks for 4.35 V when
+		 * high_battery_voltage_support is set, and FAN5405's OREG steps
+		 * are 20 mV (4.34, 4.36): charging_parameter_to_value() finds no
+		 * exact entry and returns 0 = 3.5 V.  Take the highest level that
+		 * does not exceed the request instead (4.35 V -> 4.34 V; the
+		 * stock kernel's init writes 4.36 V).
+		 */
+		u32 want = *(u32 *)data, i;
+
+		register_value = 0;
+		for (i = 0; i < GETARRAYNUM(VBAT_CV_VTH); i++)
+			if (VBAT_CV_VTH[i] <= want)
+				register_value = i;
+		battery_log(BAT_LOG_CRTI, "[forge_m5c_battery] CV %u uV -> OREG %u (%u uV)\n",
+			    want, register_value, VBAT_CV_VTH[register_value]);
+	}
+#else
 	register_value =
 	    charging_parameter_to_value(VBAT_CV_VTH, GETARRAYNUM(VBAT_CV_VTH), *(u32 *) (data));
+#endif
 	fan5405_set_oreg(register_value);
 
 	return status;
@@ -387,7 +418,7 @@ static u32 charging_get_battery_status(void *data)
 {
 	unsigned int status = STATUS_OK;
 
-#if 1 /*defined(CONFIG_POWER_EXT) || defined(CONFIG_MTK_FPGA)*/
+#if defined(CONFIG_POWER_EXT) || defined(CONFIG_MTK_FPGA)
 	*(kal_bool *) (data) = 0;	/* battery exist */
 	battery_log(BAT_LOG_CRTI, "[charging_get_battery_status] battery exist for bring up.\n");
 #else
@@ -527,7 +558,9 @@ charging_hw_init, charging_dump_register, charging_enable, charging_set_cv_volta
 	    charging_get_power_source, charging_get_csdac_full_flag,
 	    charging_set_ta_current_pattern, charging_set_error_state};
 
-s32 fan5405_chr_control_interface(CHARGING_CTRL_CMD cmd, void *data)
+/* m5c: the battery core links plain chr_control_interface (as 3.18
+ * names it); nothing in this tree calls the fan5405_-prefixed variant */
+s32 chr_control_interface(CHARGING_CTRL_CMD cmd, void *data)
 {
 	s32 status;
 

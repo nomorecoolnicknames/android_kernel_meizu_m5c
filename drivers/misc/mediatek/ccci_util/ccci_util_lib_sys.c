@@ -14,6 +14,7 @@
 #include <mt-plat/sync_write.h>
 #include <mt-plat/mtk_ccci_common.h>
 #include <linux/slab.h>
+#include <linux/module.h>
 #include <linux/kobject.h>
 #include "ccci_util_log.h"
 #include "ccci_util_lib_sys.h"
@@ -149,6 +150,36 @@ static ssize_t boot_status_store(const char *buf, size_t count)
 
 CCCI_ATTR(boot, 0660, &boot_status_show, &boot_status_store);
 
+/*
+ * Exported so the legacy BOOT-class node /sys/class/BOOT/BOOT/boot/md
+ * (created in drivers/misc/mediatek/boot) can drive modem boot exactly the
+ * way /sys/kernel/ccci/boot does. The stock m5c ccci_mdinit opens that node
+ * O_RDWR and writes the md_id character ('0' for MD1) to start the modem;
+ * this kernel tree never published it, so the daemon aborted with
+ * "boot modem fail!" and the modem never left GATED. Keep the two paths
+ * behaviourally identical (same trigger_md_boot + clear_meta_1st_boot_arg).
+ */
+int ccci_trigger_md_boot(int md_id)
+{
+	if (md_id < 0 || md_id >= MAX_MD_NUM) {
+		CCCI_UTIL_INF_MSG("invalid id(%d)\n", md_id + 1);
+		return -1;
+	}
+	if (trigger_md_boot(md_id) != 0) {
+		CCCI_UTIL_INF_MSG("md%d n/a\n", md_id + 1);
+		return -1;
+	}
+	clear_meta_1st_boot_arg(md_id);
+	return 0;
+}
+EXPORT_SYMBOL(ccci_trigger_md_boot);
+
+int ccci_get_boot_status(char *buf, int size)
+{
+	return boot_status_show(buf);
+}
+EXPORT_SYMBOL(ccci_get_boot_status);
+
 /* Sys -- enable status */
 static ssize_t ccci_md_enable_show(char *buf)
 {
@@ -197,7 +228,25 @@ static ssize_t ccci_dump_event_show(char *buf)
 CCCI_ATTR(md_chn, 0444, &ccci_dump_event_show, NULL);
 
 /* Sys -- Versin */
-static unsigned int ccci_port_ver = 6; /* ECCCI_FSM */
+/*
+ * Stock m5c userspace (gsm0710muxd, muxreport, ccci_mdinit, mtk-ril) is the
+ * 3.18-era legacy mux stack and hard-expects CCCI port version 3.
+ *   - gsm0710muxd/muxreport ccci_get_node_name(): switch(ver){case 1/2/3/5 ->
+ *     "/dev/ttyC0"; default -> NULL}. At ver 6 it returns NULL, so serial.devicename
+ *     becomes "(null)", open("(null)") -> ENOENT, mux never creates the
+ *     /dev/radio/pttycmd and pttynoti nodes and RIL aborts ("could not connect to
+ *     /dev/radio/pttynoti").  (verified by disasm of proprietary/bin/gsm0710muxd)
+ *   - ccci_mdinit main() explicitly gates node-name setup on
+ *     get_ccci_port_ver()==3 || ==5.
+ * The 4.9 BSP shipped this default as 6 (ECCCI_FSM/V2); every 3.18 sibling tree
+ * (the 3.18 worktrees) default to 3. This value is advisory to userspace only:
+ * nothing in the kernel driver branches on it (only ccci_version_show and
+ * kcfg_setting_show read it), so reporting 3 does not change eccci1 behaviour
+ * or the HS2/RPC handshake (kernel+MD firmware driven) -- it only tells the
+ * stock userspace to pick /dev/ttyC0 and the legacy (V1) node/boot layout it
+ * was built for.
+ */
+static unsigned int ccci_port_ver = 3; /* stock m5c mux/mdinit expect 3, not FSM 6 */
 static ssize_t ccci_version_show(char *buf)
 {
 	return snprintf(buf, 16, "%d\n", ccci_port_ver);

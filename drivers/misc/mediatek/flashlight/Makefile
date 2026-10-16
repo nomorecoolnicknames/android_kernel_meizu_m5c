@@ -2,6 +2,12 @@
 # Makefile for the kernel flashlight device drivers.
 #
 
+# m5c: when CONFIG_CUSTOM_KERNEL_FLASHLIGHT names a legacy strobe
+# part (e.g. "constant_flashlight"), build the 3.18-style legacy stack under
+# src/ (kd_camera_flashlight char device the mt6735-family camera HAL talks
+# to) INSTEAD of the 4.9 flashlight-core, same as the 3.18 reference tree.
+ifeq ($(CONFIG_CUSTOM_KERNEL_FLASHLIGHT),)
+
 flashlight-y := flashlight-core.o
 flashlight-y += flashlight-device.o
 
@@ -17,6 +23,12 @@ obj-$(CONFIG_MTK_FLASHLIGHT_MT6336)      += flashlights-mt6336.o
 obj-$(CONFIG_MTK_FLASHLIGHT_MT6370)      += flashlights-mt6370.o
 obj-$(CONFIG_MTK_FLASHLIGHT_DUMMY)       += flashlights-dummy.o
 obj-$(CONFIG_MTK_FLASHLIGHT_DUMMY_GPIO)  += flashlights-dummy-gpio.o
+
+else
+
+obj-$(CONFIG_MTK_FLASHLIGHT)             += src/
+
+endif
 
 ccflags-$(CONFIG_MTK_FLASHLIGHT_DEBUG)     := -DDEBUG
 ccflags-$(CONFIG_MTK_FLASHLIGHT_PT)        += -DCONFIG_MTK_FLASHLIGHT_PT

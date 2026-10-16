@@ -72,6 +72,18 @@ UINT32 S5K4ECGX_MIPI_YUV_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
 UINT32 S5K4ECGX_MIPI_JPG_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
 UINT32 S5K8AAYX_MIPI_YUV_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
 UINT32 S5K8AAYX_PVI_YUV_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+/* m5c: main S5K4H8 + sub S5K5E8, one init entry point per module
+ * variant, as in the 3.18 reference (kd_sensorlist.h there). */
+UINT32 S5K4H8_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K5E8YX_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K4H8_OFILM_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K4H8_ST_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K4H8_HOLITECH_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K4H8_SUNWIN_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K5E8_ST_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K5E8_QH_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K5E8_HOLITECH_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
+UINT32 S5K5E8_SUNWIN_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
 /*HI*/
 UINT32 HI843_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
 UINT32 HI841_MIPI_RAW_SensorInit(struct SENSOR_FUNCTION_STRUCT **pfFunc);
@@ -308,6 +320,29 @@ struct ACDK_KD_SENSOR_INIT_FUNCTION_STRUCT kdSensorList[MAX_NUM_OF_SUPPORT_SENSO
 #endif
 #if defined(S5K8AAYX_YUV)
     {S5K8AAYX_MIPI_SENSOR_ID, SENSOR_DRVNAME_S5K8AAYX_YUV, S5K8AAYX_PVI_YUV_SensorInit},
+#endif
+/*
+ * m5c: the camera HAL blobs of this phone address kernel sensor
+ * drivers by their INDEX in this array, and their index table is the one the
+ * stock kernel produced: four S5K5E8 module variants first, then four S5K4H8
+ * ones. With only "s5k4h8mipiraw" and "s5k5e8yxmipiraw" compiled in, index 0
+ * was our main sensor while the blob believed index 0 to be s5k5e8stmipiraw,
+ * so the main camera got the front sensor's 5 MP static info and tried to open
+ * /dev/S5K5E8_ST_OTP. Reproduce the stock list and order; both sensors have
+ * one driver each, which reports the variant sensor id it found in the module
+ * calibration.
+ */
+#if defined(S5K5E8YX_MIPI_RAW)
+    {S5K5E8_ST_SENSOR_ID, SENSOR_DRVNAME_S5K5E8_ST_MIPI_RAW, S5K5E8_ST_MIPI_RAW_SensorInit},
+    {S5K5E8_QH_SENSOR_ID, SENSOR_DRVNAME_S5K5E8_QH_MIPI_RAW, S5K5E8_QH_MIPI_RAW_SensorInit},
+    {S5K5E8_HOLITECH_SENSOR_ID, SENSOR_DRVNAME_S5K5E8_HOLITECH_MIPI_RAW, S5K5E8_HOLITECH_MIPI_RAW_SensorInit},
+    {S5K5E8_SUNWIN_SENSOR_ID, SENSOR_DRVNAME_S5K5E8_SUNWIN_MIPI_RAW, S5K5E8_SUNWIN_MIPI_RAW_SensorInit},
+#endif
+#if defined(S5K4H8_MIPI_RAW)
+    {S5K4H8_OFILM_SENSOR_ID, SENSOR_DRVNAME_S5K4H8_OFILM_MIPI_RAW, S5K4H8_OFILM_MIPI_RAW_SensorInit},
+    {S5K4H8_ST_SENSOR_ID, SENSOR_DRVNAME_S5K4H8_ST_MIPI_RAW, S5K4H8_ST_MIPI_RAW_SensorInit},
+    {S5K4H8_HOLITECH_SENSOR_ID, SENSOR_DRVNAME_S5K4H8_HOLITECH_MIPI_RAW, S5K4H8_HOLITECH_MIPI_RAW_SensorInit},
+    {S5K4H8_SUNWIN_SENSOR_ID, SENSOR_DRVNAME_S5K4H8_SUNWIN_MIPI_RAW, S5K4H8_SUNWIN_MIPI_RAW_SensorInit},
 #endif
 /*HI*/
 #if defined(HI843_MIPI_RAW)

@@ -34,6 +34,7 @@ obj-$(CONFIG_MEDIATEK_SOLUTION) += sched/
 obj-$(CONFIG_MTK_FREQ_HOPPING) += freqhopping/
 obj-$(CONFIG_MMC_MTK_SDIO) += mtk_sdio/
 obj-$(CONFIG_MTK_COMBO) += connectivity/
+obj-$(CONFIG_MTK_FMRADIO) += fmradio/
 obj-$(CONFIG_MTK_CONN_MD) += conn_md/
 obj-$(CONFIG_MTK_BTIF) += btif/
 obj-$(CONFIG_MTK_UNIFIED_DEBUG_INTERFACE) += udi/
@@ -71,6 +72,18 @@ obj-$(CONFIG_MTK_PMIC_NEW_ARCH)	+= pmic/
 obj-$(CONFIG_MTK_TINYSYS_SCP_SUPPORT) += scp/
 obj-$(CONFIG_MTK_TINYSYS_SCP_SUPPORT) += audio_ipi/
 obj-$(CONFIG_MTK_SENSORS_1_0) += sensors-1.0/
+# Legacy (3.18) hwmsen sensor framework (/dev/hwmsensor ABI for the stock
+# m5c HAL). Mutually exclusive with sensors-1.0: built only when the
+# 4.9-native framework is disabled. Same wiring as 3.18
+# drivers/misc/mediatek/Makefile.
+ifeq ($(CONFIG_MTK_SENSOR_SUPPORT),y)
+ifneq ($(CONFIG_MTK_SENSORS_1_0),y)
+obj-$(CONFIG_MTK_HWMON)	    += hwmon/
+obj-$(CONFIG_CUSTOM_KERNEL_ACCELEROMETER) += accelerometer/
+obj-$(CONFIG_CUSTOM_KERNEL_MAGNETOMETER) += magnetometer/
+obj-$(CONFIG_CUSTOM_KERNEL_ALSPS) += alsps/
+endif
+endif
 obj-$(CONFIG_MTK_DEVINFO_DRIVER) += devinfo/
 obj-$(CONFIG_MTK_DEVINFO_DRIVER_V2) += devinfo/
 obj-$(CONFIG_MTK_GPU_SUPPORT) += gpu/

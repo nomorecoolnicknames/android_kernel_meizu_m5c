@@ -213,11 +213,18 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
  * This is the secondary CPU boot entry.  We're using this CPUs
  * idle thread stack, but a set of temporary page tables.
  */
+/* m5c boot markers (defined in setup.c) */
+extern void forge_kmark(int ms);
+extern void forge_kmark_sec(int ms);
+#define FORGE_SEC(ms)	forge_kmark_sec((ms) + (read_cpuid_mpidr() & 0xff))
+
 asmlinkage notrace void secondary_start_kernel(void)
 {
 	struct mm_struct *mm = &init_mm;
 	unsigned int cpu;
 
+	forge_kmark(30);		/* secondary CPU runs C code */
+	FORGE_SEC(292);			/* secondary_start_kernel entered */
 	cpu = task_cpu(current);
 	set_my_cpu_offset(per_cpu_offset(cpu));
 
@@ -243,9 +250,11 @@ asmlinkage notrace void secondary_start_kernel(void)
 	 * fail to come online.
 	 */
 	check_local_cpu_capabilities();
+	FORGE_SEC(296);			/* capabilities verified */
 
 	if (cpu_ops[cpu]->cpu_postboot)
 		cpu_ops[cpu]->cpu_postboot();
+	FORGE_SEC(300);			/* cpu_postboot done */
 
 	/*
 	 * Log the CPU info before it is marked online and might get read.
@@ -256,6 +265,7 @@ asmlinkage notrace void secondary_start_kernel(void)
 	 * Enable GIC and timers.
 	 */
 	notify_cpu_starting(cpu);
+	FORGE_SEC(304);			/* notify_cpu_starting (GIC/timer) done */
 
 	store_cpu_topology(cpu);
 
@@ -267,6 +277,7 @@ asmlinkage notrace void secondary_start_kernel(void)
 	pr_info("CPU%u: Booted secondary processor [%08x]\n",
 					 cpu, read_cpuid_id());
 	update_cpu_boot_status(CPU_BOOT_SUCCESS);
+	FORGE_SEC(308);			/* CPU_BOOT_SUCCESS */
 	set_cpu_online(cpu, true);
 	complete(&cpu_running);
 
