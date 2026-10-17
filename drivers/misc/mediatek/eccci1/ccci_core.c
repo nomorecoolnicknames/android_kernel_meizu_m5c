@@ -395,8 +395,7 @@ int exec_ccci_kern_func_by_md_id(int md_id, unsigned int id, char *buf, unsigned
 #endif
 	case ID_RESET_MD:
 		CCCI_NOTICE_LOG(md->index, CHAR, "MD reset API called by %ps\n", __builtin_return_address(0));
-		ret = port_proxy_send_msg_to_user(md->port_proxy_obj,
-					CCCI_MONITOR_CH, CCCI_MD_MSG_RESET_REQUEST, 0);
+		ret = port_proxy_legacy_reset_request(md->port_proxy_obj);
 		break;
 	case ID_DUMP_MD_SLEEP_MODE:
 		md->ops->dump_info(md, DUMP_FLAG_SMEM_MDSLP, NULL, 0);

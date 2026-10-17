@@ -101,6 +101,7 @@ struct port_proxy {
 	unsigned int sim_type;
 	int dtr_state; /* only for usb bypass */
 	unsigned int critical_user_active;
+	atomic_t legacy_reset_pending; /* reset requested, READY_TO_RESET not sent yet */
 	unsigned int md_img_exist[MAX_IMG_NUM];
 	unsigned int md_img_type_is_set;
 	unsigned int mdlog_dump_done;
@@ -180,6 +181,9 @@ void *port_proxy_get_mdee(struct port_proxy *proxy_p);
 unsigned int port_proxy_get_poll_seq_num(struct port_proxy *proxy_p);
 int port_proxy_check_critical_user(struct port_proxy *proxy_p);
 int force_md_stop(struct ccci_modem *md);
+int port_proxy_send_legacy_msg_to_user(struct port_proxy *proxy_p, u32 msg);
+int port_proxy_legacy_reset_request(struct port_proxy *proxy_p);
+void port_proxy_legacy_ready_to_reset(struct port_proxy *proxy_p);
 
 #ifdef FEATURE_SCP_CCCI_SUPPORT
 int port_proxy_ccism_shm_init_ack_hdlr(struct port_proxy *proxy_p, unsigned int data);

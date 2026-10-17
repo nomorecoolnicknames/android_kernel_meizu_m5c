@@ -21,6 +21,11 @@ static void ccci_fsm_finish_event(struct ccci_modem *md, struct ccci_fsm_event *
 
 static int needforcestop;
 
+int ccci_fsm_is_gated(struct ccci_modem *md)
+{
+	return md->fsm.curr_state == CCCI_FSM_GATED;
+}
+
 int force_md_stop(struct ccci_modem *md)
 {
 	int ret = -1;
@@ -181,7 +186,7 @@ static void ccci_routine_exception(struct ccci_fsm_ctl *ctl, struct ccci_fsm_com
 static void ccci_routine_start(struct ccci_fsm_ctl *ctl, struct ccci_fsm_command *cmd)
 {
 	int ret;
-	int count = 0, user_exit = 0, hs1_got = 0, hs2_got = 0;
+	int count = 0, user_exit = 0, hs1_got = 0, hs2_got = 0, hs1_told = 0;
 	struct ccci_modem *md = ctl->md;
 	struct ccci_fsm_event *event, *next;
 	unsigned long flags;
@@ -239,6 +244,11 @@ static void ccci_routine_start(struct ccci_fsm_ctl *ctl, struct ccci_fsm_command
 			}
 		}
 		spin_unlock_irqrestore(&md->fsm.event_lock, flags);
+		/* the legacy md_init hears of the handshakes on the monitor (port_proxy.c) */
+		if (hs1_got && !hs1_told) {
+			hs1_told = 1;
+			port_proxy_send_legacy_msg_to_user(md->port_proxy_obj, 0xFAF50002); /* BOOT_UP */
+		}
 		if (ccci_check_for_ee(ctl, 0)) {
 			CCCI_ERROR_LOG(md->index, FSM, "early exception detected\n");
 			goto fail_ee;
@@ -246,6 +256,7 @@ static void ccci_routine_start(struct ccci_fsm_ctl *ctl, struct ccci_fsm_command
 
 		if (hs2_got) {
 			inject_md_status_event(md->index, MD_STA_EV_READY, NULL);
+			port_proxy_send_legacy_msg_to_user(md->port_proxy_obj, 0xFAF50001); /* BOOT_READY */
 			goto success;
 		}
 		if (atomic_read(&ctl->fs_ongoing))
@@ -350,6 +361,7 @@ success:
 	ctl->last_state = ctl->curr_state;
 	ctl->curr_state = CCCI_FSM_GATED;
 	ccci_fsm_finish_command(md, cmd, 1);
+	port_proxy_legacy_ready_to_reset(md->port_proxy_obj);
 }
 
 static void ccci_routine_wdt(struct ccci_fsm_ctl *ctl, struct ccci_fsm_command *cmd)
@@ -369,8 +381,7 @@ static void ccci_routine_wdt(struct ccci_fsm_ctl *ctl, struct ccci_fsm_command *
 		}
 	}
 	if (reset_md) {
-		port_proxy_send_msg_to_user(md->port_proxy_obj, CCCI_MONITOR_CH,
-			CCCI_MD_MSG_RESET_REQUEST, 0);
+		port_proxy_legacy_reset_request(md->port_proxy_obj);
 #ifdef CONFIG_MTK_ECCCI_C2K
 		if (md->index == MD_SYS1)
 			exec_ccci_kern_func_by_md_id(MD_SYS3, ID_RESET_MD, NULL, 0);

@@ -105,6 +105,7 @@ struct ccci_fsm_command {
 
 int ccci_fsm_init(struct ccci_modem *md);
 int ccci_fsm_append_command(struct ccci_modem *md, CCCI_FSM_COMMAND cmd_id, unsigned int flag);
+int ccci_fsm_is_gated(struct ccci_modem *md);
 int ccci_fsm_append_event(struct ccci_modem *md, CCCI_FSM_EVENT event_id,
 	unsigned char *data, unsigned int length);
 

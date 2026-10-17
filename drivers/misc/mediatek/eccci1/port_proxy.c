@@ -335,6 +335,7 @@ int port_proxy_user_unregister(struct port_proxy *proxy_p, struct ccci_port *por
 
 	CCCI_NORMAL_LOG(md_id, TAG, "critical user check: 0x%x\n", proxy_p->critical_user_active);
 	ccci_event_log("md%d: critical user check: 0x%x\n", md_id, proxy_p->critical_user_active);
+	port_proxy_legacy_ready_to_reset(proxy_p);
 	return 0;
 }
 static inline void port_proxy_channel_mapping(struct port_proxy *proxy_p)
@@ -589,9 +590,112 @@ void port_proxy_wake_up_tx_queue(struct port_proxy *proxy_p, unsigned char qno)
 }
 
 /*
+ * m5c: the Marshmallow ccci_mdinit of the stock vendor speaks the 3.18 eccci
+ * monitor protocol, whose numbers overlap this driver's CCCI_MD_MSG with other
+ * meanings (0xFAF50005 is RESET_REQUEST here, RESET_RETRY there; 0xFAF50006 is
+ * EXCEPTION here, READY_TO_RESET there).  After a modem reset it stopped the
+ * RIL chain and then waited for READY_TO_RESET forever: mtk.md1.status stayed
+ * "wait to reset" and the radio came back only with a reboot.  Every message
+ * to the monitor goes out in the old numbering, and the old kernel's part of
+ * the reset is done here: gate the modem on the request, send READY_TO_RESET
+ * once it is gated and the critical users are gone (md_init then starts it
+ * with CCCI_IOC_DO_START_MD), BOOT_UP/BOOT_READY on the handshakes.
+ * Numbers: drivers/misc/mediatek/dual_ccci/include/ccci_md.h of the 3.18 trees.
+ */
+enum {
+	LEGACY_MSG_BOOT_READY = 0xFAF50001,
+	LEGACY_MSG_BOOT_UP,
+	LEGACY_MSG_EXCEPTION,
+	LEGACY_MSG_RESET,
+	LEGACY_MSG_RESET_RETRY,
+	LEGACY_MSG_READY_TO_RESET,
+	LEGACY_MSG_BOOT_TIMEOUT,
+	LEGACY_MSG_STOP_MD_REQUEST,
+	LEGACY_MSG_START_MD_REQUEST,
+	LEGACY_MSG_ENTER_FLIGHT_MODE,
+	LEGACY_MSG_LEAVE_FLIGHT_MODE,
+	LEGACY_MSG_POWER_ON_REQUEST,
+	LEGACY_MSG_POWER_DOWN_REQUEST,
+	LEGACY_MSG_SEND_BATTERY_INFO,
+	LEGACY_MSG_NOTIFY,
+	LEGACY_MSG_STORE_NVRAM_MD_TYPE,
+	LEGACY_MSG_CFG_UPDATE,
+};
+
+static u32 port_proxy_legacy_msg(CCCI_MD_MSG msg)
+{
+	switch (msg) {
+	case CCCI_MD_MSG_FORCE_STOP_REQUEST:
+		return LEGACY_MSG_STOP_MD_REQUEST;
+	case CCCI_MD_MSG_FLIGHT_STOP_REQUEST:
+		return LEGACY_MSG_ENTER_FLIGHT_MODE;
+	case CCCI_MD_MSG_FORCE_START_REQUEST:
+		return LEGACY_MSG_START_MD_REQUEST;
+	case CCCI_MD_MSG_FLIGHT_START_REQUEST:
+		return LEGACY_MSG_LEAVE_FLIGHT_MODE;
+	case CCCI_MD_MSG_RESET_REQUEST:
+		return LEGACY_MSG_RESET;
+	case CCCI_MD_MSG_EXCEPTION:
+		return LEGACY_MSG_EXCEPTION;
+	case CCCI_MD_MSG_SEND_BATTERY_INFO:
+		return LEGACY_MSG_SEND_BATTERY_INFO;
+	case CCCI_MD_MSG_STORE_NVRAM_MD_TYPE:
+		return LEGACY_MSG_STORE_NVRAM_MD_TYPE;
+	case CCCI_MD_MSG_CFG_UPDATE:
+		return LEGACY_MSG_CFG_UPDATE;
+	default:
+		return 0; /* RANDOM_PATTERN: the old md_init has no such message */
+	}
+}
+
+static int port_proxy_send_monitor_msg(struct port_proxy *proxy_p, CCCI_CH ch, u32 msg, u32 resv);
+
+int port_proxy_send_legacy_msg_to_user(struct port_proxy *proxy_p, u32 msg)
+{
+	CCCI_NORMAL_LOG(proxy_p->md_id, TAG, "legacy monitor msg 0x%x\n", msg);
+	return port_proxy_send_monitor_msg(proxy_p, CCCI_MONITOR_CH, msg, 0);
+}
+
+/*
  * kernel inject message to user space daemon, this function may sleep
  */
 int port_proxy_send_msg_to_user(struct port_proxy *proxy_p, CCCI_CH ch, CCCI_MD_MSG msg, u32 resv)
+{
+	u32 legacy = port_proxy_legacy_msg(msg);
+
+	if (!legacy) {
+		CCCI_NORMAL_LOG(proxy_p->md_id, TAG, "monitor msg 0x%x has no legacy number, dropped\n", msg);
+		return 0;
+	}
+	CCCI_NORMAL_LOG(proxy_p->md_id, TAG, "monitor msg 0x%x sent as legacy 0x%x\n", msg, legacy);
+	return port_proxy_send_monitor_msg(proxy_p, ch, legacy, resv);
+}
+
+/* The modem is gated and the critical users are gone: let md_init start it. */
+void port_proxy_legacy_ready_to_reset(struct port_proxy *proxy_p)
+{
+	if (!atomic_read(&proxy_p->legacy_reset_pending))
+		return;
+	if (!ccci_fsm_is_gated(proxy_p->md_obj) || port_proxy_check_critical_user(proxy_p))
+		return;
+	if (atomic_xchg(&proxy_p->legacy_reset_pending, 0) == 0)
+		return;
+	port_proxy_send_legacy_msg_to_user(proxy_p, LEGACY_MSG_READY_TO_RESET);
+}
+
+/* The old kernel gated the modem itself on a reset request (md->ops->reset). */
+int port_proxy_legacy_reset_request(struct port_proxy *proxy_p)
+{
+	int ret;
+
+	atomic_set(&proxy_p->legacy_reset_pending, 1);
+	ccci_fsm_append_command(proxy_p->md_obj, CCCI_COMMAND_STOP, 0);
+	ret = port_proxy_send_msg_to_user(proxy_p, CCCI_MONITOR_CH, CCCI_MD_MSG_RESET_REQUEST, 0);
+	port_proxy_legacy_ready_to_reset(proxy_p);
+	return ret;
+}
+
+static int port_proxy_send_monitor_msg(struct port_proxy *proxy_p, CCCI_CH ch, u32 msg, u32 resv)
 {
 	struct sk_buff *skb = NULL;
 	struct ccci_header *ccci_h;
@@ -1179,7 +1283,7 @@ long port_proxy_user_ioctl(struct port_proxy *proxy_p, int ch, unsigned int cmd,
 		ccci_event_log("md%d: MD reset ioctl called by (%d)%s\n", md_id, ch, current->comm);
 		clear_meta_1st_boot_arg(md_id);
 		inject_md_status_event(md_id, MD_STA_EV_RESET_REQUEST, current->comm);
-		ret = port_proxy_send_msg_to_user(proxy_p, CCCI_MONITOR_CH, CCCI_MD_MSG_RESET_REQUEST, 0);
+		ret = port_proxy_legacy_reset_request(proxy_p);
 #ifdef CONFIG_MTK_ECCCI_C2K
 		if (md_id == MD_SYS1)
 			exec_ccci_kern_func_by_md_id(MD_SYS3, ID_RESET_MD, NULL, 0);
